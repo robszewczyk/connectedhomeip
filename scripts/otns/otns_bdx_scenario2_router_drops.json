@@ -1,0 +1,78 @@
+{
+  "description": "Apple Causeway #43975 Slide 5 & 2026-06-02 Slide 15 Scenario 2 Intermediate Router Contention Topology: Home Hub (OTBR Leader) <-> A1 (Intermediate Router) <-> {A2, Outlet (OTARequestor), A3}",
+  "topology_name": "bdx_scenario2_router_drops",
+  "radio_model": "MIDisc",
+  "default_hops": 2,
+  "default_plr": 0.0,
+  "otbr": {
+    "name": "Home Hub (OTBR Leader)",
+    "x": 100,
+    "y": 250,
+    "radio_range": 180
+  },
+  "routers": [
+    {
+      "name": "A1 (Intermediate Router)",
+      "x": 250,
+      "y": 250,
+      "radio_range": 180
+    }
+  ],
+  "ota_provider": {
+    "node_id": 1,
+    "discriminator": 3841,
+    "passcode": 20202022,
+    "port": 5541
+  },
+  "matter_nodes": [
+    {
+      "name": "Outlet",
+      "role": "ota_requestor",
+      "app": "ota-requestor-app",
+      "node_id": 201,
+      "discriminator": 3851,
+      "passcode": 20202021,
+      "x": 400,
+      "y": 250,
+      "radio_range": 180,
+      "router_eligible": false,
+      "thread_mode": "med",
+      "poll_period_ms": 200,
+      "devices": []
+    },
+    {
+      "name": "A2",
+      "role": "traffic_sibling",
+      "app": "all-devices-app",
+      "node_id": 202,
+      "discriminator": 3852,
+      "passcode": 20202021,
+      "x": 380,
+      "y": 170,
+      "radio_range": 180,
+      "router_eligible": false,
+      "thread_mode": "med",
+      "groupcast": true,
+      "devices": [
+        "on-off-light:1"
+      ]
+    },
+    {
+      "name": "A3",
+      "role": "traffic_sibling",
+      "app": "all-devices-app",
+      "node_id": 203,
+      "discriminator": 3853,
+      "passcode": 20202021,
+      "x": 380,
+      "y": 330,
+      "radio_range": 180,
+      "router_eligible": false,
+      "thread_mode": "med",
+      "groupcast": true,
+      "devices": [
+        "on-off-light:1"
+      ]
+    }
+  ]
+}
