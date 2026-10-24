@@ -1,0 +1,73 @@
+{
+  "description": "Apple Causeway #43975 Slide 10 & 2026-06-09 Tiger Team Multi-Hop BDX OTA Topology: 4-node / 3-hop linear chain (Home Hub 1 OTBR <-> Home Hub 2 Router 1 <-> A1 Router 2 <-> OTARequestor SED/MED)",
+  "topology_name": "bdx_multihop",
+  "radio_model": "MIDisc",
+  "default_hops": 3,
+  "default_plr": 0.0,
+  "otbr": {
+    "name": "Home Hub 1 (OTBR Leader)",
+    "x": 100,
+    "y": 250,
+    "radio_range": 180
+  },
+  "routers": [
+    {
+      "name": "Home Hub 2 (Router 1, Hop 1)",
+      "x": 250,
+      "y": 250,
+      "radio_range": 180
+    },
+    {
+      "name": "A1 (Router 2, Hop 2)",
+      "x": 400,
+      "y": 250,
+      "radio_range": 180
+    }
+  ],
+  "hop_presets": {
+    "1": {
+      "description": "1-Hop Direct Child of Home Hub 1 (OTBR Leader <-> OTARequestor)",
+      "active_routers": 0,
+      "requestor_x": 220,
+      "requestor_y": 250,
+      "requestor_radio_range": 180
+    },
+    "2": {
+      "description": "2-Hop Chain via Home Hub 2 (OTBR Leader <-> Router 1 <-> OTARequestor)",
+      "active_routers": 1,
+      "requestor_x": 400,
+      "requestor_y": 250,
+      "requestor_radio_range": 180
+    },
+    "3": {
+      "description": "3-Hop Chain via Home Hub 2 and A1 (OTBR Leader <-> Router 1 <-> A1 Router 2 <-> OTARequestor)",
+      "active_routers": 2,
+      "requestor_x": 550,
+      "requestor_y": 250,
+      "requestor_radio_range": 180
+    }
+  },
+  "ota_provider": {
+    "node_id": 1,
+    "discriminator": 3841,
+    "passcode": 20202022,
+    "port": 5541
+  },
+  "matter_nodes": [
+    {
+      "name": "OTARequestor",
+      "role": "ota_requestor",
+      "app": "ota-requestor-app",
+      "node_id": 101,
+      "discriminator": 3840,
+      "passcode": 20202021,
+      "x": 550,
+      "y": 250,
+      "radio_range": 180,
+      "router_eligible": false,
+      "thread_mode": "med",
+      "poll_period_ms": 200,
+      "devices": []
+    }
+  ]
+}

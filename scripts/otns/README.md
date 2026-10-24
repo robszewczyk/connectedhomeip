@@ -24,6 +24,13 @@ Linux example targets that use the OpenThread Inet endpoint (`-openthread-endpoi
   "./scripts/build/build_examples.py \
     --target linux-x64-chip-tool-no-ble \
     build"
+
+# Build ota-provider-app and OTNS-enabled ota-requestor-app for BDX benchmarks
+./scripts/run_in_build_env.sh \
+  "./scripts/build/build_examples.py \
+    --target linux-x64-ota-provider \
+    --target linux-x64-ota-requestor-no-wifi-no-ble-openthread-endpoint-otns \
+    build"
 ```
 
 When an OTNS-enabled example binary is launched by OTNS (`otns`), pass `--thread-arg` for each OpenThread platform argument (the OTNS node ID and simulator Unix socket path):
@@ -102,4 +109,9 @@ Each simulation run is automatically archived under `sim_logs/<YYYYMMDD_HHMMSS>_
 - **`scripts/otns/analyze_delay_report_sweep.py`**: Compares multiple `DelayReportData` parameter runs in `sim_logs/`, generating controller `IM:ReportData` latency CDFs (`cdf_delay_report_controller_rx.png`), packet-drop & MAC failure comparisons (`delay_report_packet_drops_comparison.png`), and summary statistics (`delay_report_sweep_stats.json`).
   ```bash
   python3 scripts/otns/analyze_delay_report_sweep.py sim_logs
+  ```
+- **`scripts/otns/otns_bdx_benchmark.py` & `scripts/otns/analyze_bdx_benchmark.py`**: Orchestrates and analyzes Matter BDX (OTA Software Update over Thread) benchmarks across multi-hop (`scripts/otns/otns_bdx_multihop.json`, 1–3 hops, `MED` & `SED`, `0%` & `5%` FER, `64 B..1024 B` block sizes) and intermediate-router contention (`scripts/otns/otns_bdx_scenario2_router_drops.json`) topologies.
+  ```bash
+  python3 /workspace/scripts/otns/otns_bdx_benchmark.py --suite all
+  python3 scripts/otns/analyze_bdx_benchmark.py --sim-logs-dir sim_logs --output-dir /tmp/bdx_results
   ```
