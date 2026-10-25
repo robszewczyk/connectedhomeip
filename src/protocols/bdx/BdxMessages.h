@@ -36,6 +36,8 @@ namespace bdx {
 
 inline constexpr uint16_t kMaxFileDesignatorLen = 0xFF;
 
+inline constexpr uint16_t kDataBlockHeaderSize = sizeof(uint32_t);
+
 inline constexpr char kProtocolName[] = "BDX";
 
 enum class MessageType : uint8_t

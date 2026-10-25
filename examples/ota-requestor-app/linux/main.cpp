@@ -79,6 +79,7 @@ constexpr uint16_t kOptionAutoApplyImage       = 'a';
 constexpr uint16_t kOptionRequestorCanConsent  = 'c';
 constexpr uint16_t kOptionDisableNotify        = 'd';
 constexpr uint16_t kOptionOtaDownloadPath      = 'f';
+constexpr uint16_t kOptionLargePayload         = 'l';
 constexpr uint16_t kOptionMaxBDXBlockSize      = 'm';
 constexpr uint16_t kOptionPeriodicQueryTimeout = 'p';
 constexpr uint16_t kOptionUserConsentState     = 'u';
@@ -100,6 +101,7 @@ OptionDef cmdLineOptionsDef[] = {
     { "requestorCanConsent", chip::ArgParser::kArgumentRequired, kOptionRequestorCanConsent },
     { "disableNotifyUpdateApplied", chip::ArgParser::kNoArgument, kOptionDisableNotify },
     { "otaDownloadPath", chip::ArgParser::kArgumentRequired, kOptionOtaDownloadPath },
+    { "largePayload", chip::ArgParser::kNoArgument, kOptionLargePayload },
     { "periodicQueryTimeout", chip::ArgParser::kArgumentRequired, kOptionPeriodicQueryTimeout },
     { "userConsentState", chip::ArgParser::kArgumentRequired, kOptionUserConsentState },
     { "watchdogTimeout", chip::ArgParser::kArgumentRequired, kOptionWatchdogTimeout },
@@ -123,6 +125,8 @@ OptionSet cmdLineOptions = {
     "  -f, --otaDownloadPath <file path>\n"
     "       If supplied, the OTA image is downloaded to the given fully-qualified file-path.\n"
     "       Otherwise, the default location for the downloaded image is at /tmp/test.bin\n"
+    "  -l, --largePayload\n"
+    "       If supplied, use TCP transport for large payload BDX transfer.\n"
     "  -m, --maxBDXBlockSize <size>\n"
     "        Value for the maximum BDX block size to use for the transfer.\n"
     "        If none is supplied, a default value will be used.\n"
@@ -317,6 +321,9 @@ bool HandleOptions(const char * aProgram, OptionSet * aOptions, int aIdentifier,
         break;
     case kSkipExecImageFile:
         gSkipExecImageFile = true;
+        break;
+    case kOptionLargePayload:
+        gRequestorCore.SetLargePayload(true);
         break;
     case kOptionMaxBDXBlockSize: {
         auto blockSize = static_cast<uint16_t>(strtoul(aValue, NULL, 0));

@@ -366,7 +366,11 @@ void DefaultOTARequestor::ConnectToProvider(OnConnectedAction onConnectedAction)
     ChipLogDetail(SoftwareUpdate, "Establishing session to provider node ID 0x" ChipLogFormatX64 " on fabric index %d",
                   ChipLogValueX64(mProviderLocation.Value().providerNodeID), mProviderLocation.Value().fabricIndex);
 
-    mCASESessionManager->FindOrEstablishSession(GetProviderScopedId(), &mOnConnectedCallback, &mOnConnectionFailureCallback);
+    TransportPayloadCapability transportPayloadCapability =
+        mSupportLargePayload ? TransportPayloadCapability::kLargePayload : TransportPayloadCapability::kMRPPayload;
+
+    mCASESessionManager->FindOrEstablishSession(GetProviderScopedId(), &mOnConnectedCallback, &mOnConnectionFailureCallback,
+                                                transportPayloadCapability);
 }
 
 void DefaultOTARequestor::DisconnectFromProvider()
@@ -820,9 +824,15 @@ CHIP_ERROR DefaultOTARequestor::StartDownload(Messaging::ExchangeManager & excha
 
     TransferSession::TransferInitData initOptions;
     initOptions.TransferCtlFlags = bdx::TransferControlFlags::kReceiverDrive;
-    initOptions.MaxBlockSize     = mOtaRequestorDriver->GetMaxDownloadBlockSize();
-    initOptions.FileDesLength    = static_cast<uint16_t>(mFileDesignator.size());
-    initOptions.FileDesignator   = reinterpret_cast<const uint8_t *>(mFileDesignator.data());
+
+    size_t maxAppLen           = sessionHandle->GetMaxAppMessageLen();
+    size_t sessionMaxBlockSize = (maxAppLen > bdx::kDataBlockHeaderSize) ? (maxAppLen - bdx::kDataBlockHeaderSize) : 0;
+    size_t specMaxBlockSize    = sessionHandle->AllowsLargePayload() ? 8192 : 1024;
+    initOptions.MaxBlockSize   = static_cast<uint16_t>(
+        std::min({ static_cast<size_t>(mOtaRequestorDriver->GetMaxDownloadBlockSize()), sessionMaxBlockSize, specMaxBlockSize }));
+
+    initOptions.FileDesLength  = static_cast<uint16_t>(mFileDesignator.size());
+    initOptions.FileDesignator = reinterpret_cast<const uint8_t *>(mFileDesignator.data());
 
     chip::Messaging::ExchangeContext * exchangeCtx = exchangeMgr.NewContext(sessionHandle, &mBdxMessenger);
     VerifyOrReturnError(exchangeCtx != nullptr, CHIP_ERROR_NO_MEMORY);

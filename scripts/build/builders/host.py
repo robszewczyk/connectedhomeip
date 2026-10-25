@@ -705,6 +705,7 @@ class HostBuilder(GnBuilder):
                 raise Exception("OpenThread EndPoint mode does not support Wifi")
 
             self.extra_gn_options.append('chip_system_config_use_openthread_inet_endpoints=true')
+            self.extra_gn_options.append('openthread_config_tcp_enable=true')
 
         if enable_otns:
             if not openthread_endpoint:

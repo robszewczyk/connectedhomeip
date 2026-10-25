@@ -110,6 +110,8 @@ public:
     // NOTE: Does not persist across reboot.
     void SetMetadataForProvider(ByteSpan metadataForProvider) override { mMetadataForProvider.SetValue(metadataForProvider); }
 
+    void SetLargePayload(bool supportLargePayload) { mSupportLargePayload = supportLargePayload; }
+
     // Add a default OTA provider to the cached list
     CHIP_ERROR AddDefaultOtaProvider(const ProviderLocationType & providerLocation) override;
 
@@ -356,6 +358,7 @@ private:
     // in the OTARequestorDriver on reboot.
     Optional<ProviderLocationType> mProviderLocation;
     SessionHolder mSessionHolder;
+    bool mSupportLargePayload = false;
 };
 
 } // namespace chip

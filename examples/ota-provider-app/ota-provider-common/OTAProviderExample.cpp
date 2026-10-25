@@ -63,7 +63,11 @@ constexpr uint8_t kUpdateTokenLen  = 32; // must be between 8 and 32
 constexpr size_t kOtaHeaderMaxSize = 1024;
 
 // Arbitrary BDX Transfer Params
-constexpr uint16_t kMaxBdxBlockSize                = 1024;
+#if INET_CONFIG_ENABLE_TCP_ENDPOINT
+constexpr uint16_t kMaxBdxBlockSize = 8192;
+#else
+constexpr uint16_t kMaxBdxBlockSize = 1024;
+#endif // INET_CONFIG_ENABLE_TCP_ENDPOINT
 constexpr chip::System::Clock::Timeout kBdxTimeout = chip::System::Clock::Seconds16(5 * 60); // OTA Spec mandates >= 5 minutes
 constexpr uint32_t kBdxServerPollIntervalMillis    = 50;                                     // poll every 50ms by default
 

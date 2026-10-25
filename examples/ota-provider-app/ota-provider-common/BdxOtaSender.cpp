@@ -127,8 +127,14 @@ void BdxOtaSender::HandleTransferSessionOutput(TransferSession::OutputEvent & ev
         // common supported control modes. It will also default to the smaller
         // block size.
         TransferSession::TransferAcceptData acceptData;
-        acceptData.ControlMode  = TransferControlFlags::kReceiverDrive; // OTA must use receiver drive
-        acceptData.MaxBlockSize = mTransfer.GetTransferBlockSize();
+        acceptData.ControlMode = TransferControlFlags::kReceiverDrive; // OTA must use receiver drive
+
+        uint16_t blockSize  = mTransfer.GetTransferBlockSize();
+        size_t maxAppLen    = mExchangeCtx->GetSessionHandle()->GetMaxAppMessageLen();
+        size_t sessionMaxBS = (maxAppLen > chip::bdx::kDataBlockHeaderSize) ? (maxAppLen - chip::bdx::kDataBlockHeaderSize) : 0;
+        size_t specMaxBS    = mExchangeCtx->GetSessionHandle()->AllowsLargePayload() ? 8192 : 1024;
+
+        acceptData.MaxBlockSize = static_cast<uint16_t>(std::min({ static_cast<size_t>(blockSize), sessionMaxBS, specMaxBS }));
         acceptData.StartOffset  = mTransfer.GetStartOffset();
         acceptData.Length       = mTransfer.GetTransferLength();
         VerifyOrReturn(mTransfer.AcceptTransfer(acceptData) == CHIP_NO_ERROR,
