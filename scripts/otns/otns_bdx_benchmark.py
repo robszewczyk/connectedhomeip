@@ -102,6 +102,7 @@ OTA_PROVIDER_LOG_PATH = "/tmp/ota_provider.log"
 OTA_PROVIDER_KVS_PATH = "/tmp/chip_kvs_ota_provider"
 
 SUITE2_BLOCK_SIZES = [64, 128, 224, 340, 416, 512, 608, 704, 800, 896, 1024]
+SUITE_TCP_BLOCK_SIZES = [64, 128, 224, 340, 512, 1024, 2048, 4096, 8192]
 
 
 @dataclass
@@ -119,6 +120,7 @@ class BdxMatterNodeSpec:
     thread_mode: str = "med"  # "med" or "sed"
     poll_period_ms: int = 250
     max_bdx_block_size: int = 1024
+    large_payload: bool = False
     ota_download_path: str = "/tmp/ota_dl.bin"
     requestor_sai_ms: Optional[int] = None
     requestor_sii_ms: Optional[int] = None
@@ -153,6 +155,7 @@ def load_bdx_topology(
     poll_period_ms: int = 250,
     plr: float = 0.0,
     max_bdx_block_size: int = 1024,
+    large_payload: bool = False,
     requestor_sai_ms: Optional[int] = None,
     requestor_sii_ms: Optional[int] = None,
 ) -> BdxTopologyConfig:
@@ -217,6 +220,7 @@ def load_bdx_topology(
                 thread_mode=nmode,
                 poll_period_ms=npoll,
                 max_bdx_block_size=max_bdx_block_size,
+                large_payload=large_payload if app_type == "ota-requestor" else False,
                 ota_download_path=str(item.get("ota_download_path", f"/tmp/ota_dl_{nid}.bin")),
                 requestor_sai_ms=requestor_sai_ms if app_type == "ota-requestor" else None,
                 requestor_sii_ms=requestor_sii_ms if app_type == "ota-requestor" else None,
@@ -380,6 +384,8 @@ def write_node_wrappers(
         wrapper_path = os.path.join(WRAPPER_DIR, f"ot-matter-node-{node.node_id}.sh")
         if node.app_type == "ota-requestor":
             mrp_flags = ""
+            if node.large_payload:
+                mrp_flags += " --largePayload"
             if node.requestor_sai_ms is not None:
                 mrp_flags += f" --active-retransmit-timeout {node.requestor_sai_ms}"
             if node.requestor_sii_ms is not None:
@@ -500,7 +506,13 @@ def prepare_bdx_system(
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["ip", "-6", "addr", "replace", "fd00:dead:beef:1::1/64", "dev", backbone_if],
+        ["ip", "-6", "addr", "del", "fd00:dead:beef:1::1/64", "dev", backbone_if],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["ip", "-6", "addr", "replace", "fdde:ad00:beef:cafe::1/64", "dev", backbone_if],
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -1034,13 +1046,14 @@ def archive_bdx_transfer_run(
 
     req_node = next((n for n in topo_cfg.matter_nodes if n.app_type == "ota-requestor"), topo_cfg.matter_nodes[0])
     plr_pct = int(round(topo_cfg.plr * 100))
+    transport_str = "_tcp" if req_node.large_payload else ""
     sai_str = f"_sai{req_node.requestor_sai_ms}" if req_node.requestor_sai_ms else ""
     contend_str = "_contend" if contend_traffic else ""
     tag_str = f"_{sanitize_slug(run_tag)}" if run_tag else ""
 
     run_id = (
         f"{ts_str}_{sanitize_slug(suite_name)}_{sanitize_slug(topo_cfg.topology_id)}_"
-        f"{topo_cfg.hops}hop_{req_node.thread_mode}_plr{plr_pct}_blk{block_size}{sai_str}{contend_str}{tag_str}"
+        f"{topo_cfg.hops}hop_{req_node.thread_mode}_plr{plr_pct}_blk{block_size}{transport_str}{sai_str}{contend_str}{tag_str}"
     )
     run_dir = os.path.join(log_dir, run_id)
     nodes_dir = os.path.join(run_dir, "nodes")
@@ -1182,6 +1195,8 @@ def archive_bdx_transfer_run(
         "run_id": run_id,
         "suite": suite_name,
         "topology_id": topo_cfg.topology_id,
+        "transport": "tcp" if req_node.large_payload else "udp",
+        "large_payload": bool(req_node.large_payload),
         "hops": topo_cfg.hops,
         "thread_mode": req_node.thread_mode,
         "poll_period_ms": req_node.poll_period_ms if req_node.thread_mode == "sed" else None,
@@ -1225,6 +1240,7 @@ def archive_bdx_transfer_run(
                         "run_id": run_id,
                         "suite": suite_name,
                         "topology_id": topo_cfg.topology_id,
+                        "transport": "tcp" if req_node.large_payload else "udp",
                         "hops": topo_cfg.hops,
                         "thread_mode": req_node.thread_mode,
                         "plr": topo_cfg.plr,
@@ -1502,6 +1518,7 @@ def run_otns_session_transfers(
     chip_tool_bin: str,
     log_dir: str,
     reuse_state: bool = True,
+    large_payload: bool = False,
     requestor_sai_ms: Optional[int] = None,
     requestor_sii_ms: Optional[int] = None,
     contend_traffic: bool = False,
@@ -1509,7 +1526,8 @@ def run_otns_session_transfers(
     run_tag: Optional[str] = None,
 ) -> List[Tuple[str, Dict[str, Any]]]:
     """Start an OTNS session for (config, hops, mode, plr) and execute BDX transfers for each block_size."""
-    max_req_block = max(1024, max(block_sizes))
+    default_max = 8192 if large_payload else 1024
+    max_req_block = max(default_max, max(block_sizes))
     topo_cfg = load_bdx_topology(
         config_path=config_path,
         hops=hops,
@@ -1517,6 +1535,7 @@ def run_otns_session_transfers(
         poll_period_ms=poll_period_ms,
         plr=plr,
         max_bdx_block_size=max_req_block,
+        large_payload=large_payload,
         requestor_sai_ms=requestor_sai_ms,
         requestor_sii_ms=requestor_sii_ms,
     )
@@ -1650,7 +1669,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--suite",
-        choices=["single", "suite1", "suite2", "suite3", "suite4", "all"],
+        choices=["single", "suite1", "suite2", "suite3", "suite4", "suite_tcp", "all"],
         default="single",
         help="Benchmark suite to execute",
     )
@@ -1658,6 +1677,13 @@ def main() -> int:
     parser.add_argument("--mode", choices=["med", "sed"], default="med", help="Thread mode for OTARequestor")
     parser.add_argument("--poll-period-ms", type=int, default=200, help="SED data poll period in ms (default: 200)")
     parser.add_argument("--plr", type=float, default=0.0, help="OTNS packet loss ratio (0.0 to 1.0)")
+    parser.add_argument(
+        "--tcp",
+        "--large-payload",
+        dest="large_payload",
+        action="store_true",
+        help="Use BDX over TCP (--largePayload) for OTA transfers",
+    )
     parser.add_argument("--block-size", type=int, default=340, help="BDX MaxBlockSize in bytes for single run")
     parser.add_argument(
         "--block-sizes",
@@ -1711,12 +1737,60 @@ def main() -> int:
             chip_tool_bin=args.chip_tool_bin,
             log_dir=args.log_dir,
             reuse_state=args.reuse_state,
+            large_payload=args.large_payload,
             requestor_sai_ms=args.requestor_sai_ms,
             requestor_sii_ms=args.requestor_sii_ms,
             contend_traffic=args.contend_traffic,
             timeout_s=args.timeout_sec,
             run_tag=args.run_tag,
         )
+        return 0
+
+    if args.suite == "suite_tcp":
+        print("\n================ SUITE TCP: BDX over TCP Block-Size Sweep (64B..8192B, 1-3 Hops, 0% & 5% FER) ================")
+        sweep_blocks = (
+            [int(x.strip()) for x in args.block_sizes.split(",") if x.strip()]
+            if args.block_sizes
+            else SUITE_TCP_BLOCK_SIZES
+        )
+        done_suite_tcp = set()
+        idx_file = os.path.join(args.log_dir, "runs_index.jsonl")
+        if os.path.isfile(idx_file):
+            with open(idx_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if rec.get("suite") == "suite_tcp_blocksizes" and rec.get("completed"):
+                            done_suite_tcp.add((int(rec["hops"]), str(rec["thread_mode"]), round(float(rec["plr"]), 3), int(rec["block_size"])))
+                    except Exception:
+                        pass
+        for hops in (1, 2, 3):
+            for plr in (0.0, 0.05):
+                rem_blocks = [b for b in sweep_blocks if (hops, args.mode, round(plr, 3), b) not in done_suite_tcp]
+                if not rem_blocks:
+                    print(f"  [suite_tcp] Skipping hops={hops} mode={args.mode} plr={plr} (all {len(sweep_blocks)} block sizes already completed)")
+                    continue
+                run_otns_session_transfers(
+                    config_path=multihop_cfg,
+                    suite_name="suite_tcp_blocksizes",
+                    hops=hops,
+                    mode=args.mode,
+                    poll_period_ms=args.poll_period_ms,
+                    plr=plr,
+                    block_sizes=rem_blocks,
+                    image_size_bytes=args.image_size_bytes,
+                    ota_requestor_bin=args.ota_requestor_bin,
+                    ota_provider_bin=args.ota_provider_bin,
+                    all_devices_bin=args.all_devices_bin,
+                    chip_tool_bin=args.chip_tool_bin,
+                    log_dir=args.log_dir,
+                    reuse_state=True,
+                    large_payload=True,
+                    timeout_s=args.timeout_sec,
+                    run_tag=args.run_tag,
+                )
         return 0
 
     if args.suite in ("suite1", "all"):

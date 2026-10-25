@@ -408,7 +408,7 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
                 msg_retry_cnt[mc] = 0
                 if mname in ("BDX:ReceiveAccept", "BDX:Block", "BDX:BlockEOF"):
                     if mname in ("BDX:Block", "BDX:BlockEOF"):
-                        block_tx_by_exch[exch] = (ts, mc)
+                        block_tx_by_exch[exch] = (ts, mc, mname)
                     bdx_events_timeline.append({"t_rel_s": round(ts - t0, 4), "event": mname, "dir": "TX"})
                 continue
 
@@ -449,9 +449,9 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
                 if mname in ("BDX:ReceiveInit", "BDX:BlockQuery", "BDX:BlockAck", "BDX:BlockAckEOF"):
                     bdx_events_timeline.append({"t_rel_s": round(ts - t0, 4), "event": mname, "dir": "RX"})
                     if mname in ("BDX:BlockQuery", "BDX:BlockAck", "BDX:BlockAckEOF") and exch in block_tx_by_exch:
-                        tx_ts, mc = block_tx_by_exch.pop(exch)
+                        tx_ts, mc, tx_mname = block_tx_by_exch.pop(exch)
                         rtt_ms = (ts - tx_ts) * 1000.0
-                        if 1.0 <= rtt_ms <= 60000.0:
+                        if 1.0 <= rtt_ms <= 60000.0 and tx_mname == "BDX:Block":
                             block_rtts_ms.append(round(rtt_ms, 2))
                         retries_per_block.append(msg_retry_cnt.get(mc, 0))
 
@@ -483,6 +483,8 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
         counts = {
             "udp_tx": 0,
             "udp_rx": 0,
+            "tcp_tx": 0,
+            "tcp_rx": 0,
             "no_bufs": 0,
             "queue_mgmt_drops": 0,
             "reassembly_timeout": 0,
@@ -508,6 +510,10 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
                     counts["udp_tx"] += 1
                 elif "Received IPv6 UDP msg" in line:
                     counts["udp_rx"] += 1
+                elif "Sent IPv6 TCP msg" in line:
+                    counts["tcp_tx"] += 1
+                elif "Received IPv6 TCP msg" in line:
+                    counts["tcp_rx"] += 1
                 if "error:NoBufs" in line:
                     counts["no_bufs"] += 1
                 if "Dropping (queue mgmt)" in line:
@@ -624,18 +630,25 @@ def analyze_all_bdx_runs(sim_logs_dir: str) -> List[Dict[str, Any]]:
         frames_per_1kb = pcap_stats["total_frames"] / img_kb
 
         bsize = int(manifest["block_size"])
+        transport = str(manifest.get("transport", "tcp" if manifest.get("large_payload", False) else "udp")).lower()
+        rtt_mean = float(log_stats["block_rtt_ms"]["mean"])
+        rtt_ms_per_1kb = rtt_mean * (1024.0 / bsize) if bsize > 0 else 0.0
         runs.append(
             {
                 "run_id": manifest["run_id"],
                 "run_dir": run_dir,
                 "suite": manifest["suite"],
                 "topology_id": manifest["topology_id"],
+                "transport": transport,
+                "large_payload": bool(manifest.get("large_payload", transport == "tcp")),
                 "hops": int(manifest["hops"]),
                 "thread_mode": manifest.get("thread_mode", "med"),
                 "plr": float(manifest.get("plr", 0.0)),
                 "block_size": bsize,
-                "expected_6lowpan_fragments": BLOCK_SIZE_TO_6LOWPAN_FRAGS.get(
-                    bsize, max(1, int(math.ceil((bsize + 84) / 88.0)))
+                "expected_6lowpan_fragments": (
+                    5
+                    if transport == "tcp" and bsize >= 512
+                    else BLOCK_SIZE_TO_6LOWPAN_FRAGS.get(bsize, max(1, int(math.ceil((bsize + 84) / 88.0))))
                 ),
                 "image_size_bytes": img_bytes,
                 "requestor_sai_ms": int(manifest.get("requestor_sai_ms", 300)),
@@ -644,6 +657,7 @@ def analyze_all_bdx_runs(sim_logs_dir: str) -> List[Dict[str, Any]]:
                 "completed": bool(manifest.get("transfer_metrics", {}).get("completed", False)),
                 "transfer_duration_s": round(dur_s, 3),
                 "sec_per_1kb": round(sec_per_1kb, 4),
+                "block_rtt_ms_per_1kb": round(rtt_ms_per_1kb, 2),
                 "projected_882kb_min": round(proj_882kb_min, 2),
                 "projected_1620kb_min": round(proj_1620kb_min, 2),
                 "phy_bytes_per_1kb": round(phy_bytes_per_1kb, 1),
@@ -694,7 +708,7 @@ def plot_duration_vs_blocksize_boxplot(runs: List[Dict[str, Any]], out_dir: str)
     hop_colors = {1: "#1a73e8", 2: "#1e8e3e", 3: "#e37400"}
     hop_offsets = {1: -0.25, 2: 0.0, 3: 0.25}
 
-    s2_runs = [r for r in runs if r["suite"] == "suite2_blocksizes"] or runs
+    s2_runs = [r for r in runs if r["suite"] == "suite2_blocksizes" and r.get("transport", "udp") == "udp"] or runs
     # Left Subplot: Per-Block RTT Boxplot across Block Sizes & Hops + Projected 882KB Duration Curve
     for hops in (1, 2, 3):
         medians_proj_min = []
@@ -873,7 +887,7 @@ def plot_network_load_per_1kb(runs: List[Dict[str, Any]], out_dir: str) -> str:
         y=0.98,
     )
 
-    s2_runs = [r for r in runs if r["suite"] == "suite2_blocksizes"] or runs
+    s2_runs = [r for r in runs if r["suite"] == "suite2_blocksizes" and r.get("transport", "udp") == "udp"] or runs
     block_sizes = sorted(BLOCK_SIZE_TO_6LOWPAN_FRAGS.keys())
     x_pos = np.arange(len(block_sizes))
     x_labels = [f"{b}B\n({BLOCK_SIZE_TO_6LOWPAN_FRAGS[b]}f)" for b in block_sizes]
@@ -949,7 +963,7 @@ def plot_slide10_multihop_comparison(runs: List[Dict[str, Any]], out_dir: str) -
         y=0.99,
     )
 
-    s1_runs = [r for r in runs if r["suite"] == "suite1_slide10"] or runs
+    s1_runs = [r for r in runs if r["suite"] == "suite1_slide10" and r.get("transport", "udp") == "udp"] or runs
     ref_s10 = APPLE_REFERENCE["slide10_3hop"]
 
     # Panel A: Apple Slide 10 Success Rate (40% vs 100%) vs OTNS SED First-Attempt (Zero-Retry) Block Rate & 8KB Transfer Completion
@@ -1106,7 +1120,7 @@ def plot_scenario1_latency_and_mrp_retries(runs: List[Dict[str, Any]], out_dir: 
         y=0.99,
     )
 
-    s3_runs = [r for r in runs if r["suite"] == "suite3_scenario1_mrp"] or runs
+    s3_runs = [r for r in runs if r["suite"] == "suite3_scenario1_mrp" and r.get("transport", "udp") == "udp"] or runs
     ref_lat = APPLE_REFERENCE["slide3_scenario1_latency_ms"]
     ref_retx = APPLE_REFERENCE["slide3_mrp_retry_intervals_ms"]
     ref_s4 = APPLE_REFERENCE["slide4_retries_per_block_1024b"]
@@ -1342,7 +1356,7 @@ def plot_scenario2_router_contention(runs: List[Dict[str, Any]], out_dir: str) -
         y=0.98,
     )
 
-    scen2_runs = [r for r in runs if "scenario2" in r["topology_id"] or r["suite"] == "suite4_scenario2_router"]
+    scen2_runs = [r for r in runs if ("scenario2" in r["topology_id"] or r["suite"] == "suite4_scenario2_router") and r.get("transport", "udp") == "udp"]
     r_1024_cont = [r for r in scen2_runs if r["block_size"] == 1024 and r["contend_traffic"]]
     r_340_cont = [r for r in scen2_runs if r["block_size"] == 340 and r["contend_traffic"]]
 
@@ -1500,6 +1514,193 @@ def plot_scenario2_router_contention(runs: List[Dict[str, Any]], out_dir: str) -
     return out_path
 
 
+def plot_tcp_vs_udp_duration_and_latency(runs: List[Dict[str, Any]], out_dir: str) -> str:
+    """Plot 6: BDX over TCP (64B–8192B) vs. BDX over UDP/MRP (64B–1024B) — Transfer Duration & Per-Block Latency vs. Block Size."""
+    configure_matplotlib_style()
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(17.5, 11.2))
+    fig.suptitle(
+        "Matter BDX Over Thread: BDX Over TCP (64 B – 8192 B) vs. BDX Over UDP/MRP (64 B – 1024 B)\n"
+        "(Transfer Duration, Per-Block Latency, Amortized Block Latency per 1 KB & 802.15.4 PHY Load Across 1–3 Hops)",
+        y=0.98,
+    )
+
+    tcp_block_sizes = [64, 128, 224, 340, 512, 1024, 2048, 4096, 8192]
+    x_pos = np.arange(len(tcp_block_sizes))
+    x_labels = [f"{b}B" for b in tcp_block_sizes]
+    hop_colors = {1: "#1a73e8", 2: "#1e8e3e", 3: "#e37400"}
+
+    tcp_runs = [r for r in runs if r.get("transport") == "tcp" and r["suite"] in ("suite_tcp", "suite_tcp_blocksizes")]
+    if not tcp_runs:
+        tcp_runs = [r for r in runs if r.get("transport") == "tcp" and r["thread_mode"] == "med" and not r["contend_traffic"]]
+    tcp_sed_runs = [r for r in runs if r.get("transport") == "tcp" and r["thread_mode"] == "sed"]
+    udp_runs = [r for r in runs if r.get("transport", "udp") == "udp" and r["suite"] == "suite2_blocksizes"]
+
+    # -------------------------------------------------------------------------
+    # Panel A (Top-Left): Normalized Transfer Duration (s/KB) vs. Block Size (0% FER, 1–3 Hops)
+    # -------------------------------------------------------------------------
+    for hops in (1, 2, 3):
+        col = hop_colors[hops]
+        # TCP curve (64B..8192B)
+        txs, tys = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in tcp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m:
+                txs.append(x_pos[idx])
+                tys.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+        if txs:
+            ax1.plot(txs, tys, "-o", color=col, linewidth=2.2, markersize=6, label=f"TCP {hops}-Hop (0% FER)")
+
+        # UDP curve (64B..1024B)
+        uxs, uys = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in udp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m:
+                uxs.append(x_pos[idx])
+                uys.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+        if uxs:
+            ax1.plot(uxs, uys, "--^", color=col, linewidth=1.7, markersize=5, alpha=0.82, label=f"UDP/MRP {hops}-Hop (0% FER)")
+
+    # Overlay 3-Hop SED TCP (0% FER)
+    sed0_x, sed0_y = [], []
+    for idx, b in enumerate(tcp_block_sizes):
+        m = [r for r in tcp_sed_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+        if m:
+            sed0_x.append(x_pos[idx])
+            sed0_y.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+    if sed0_x:
+        ax1.plot(sed0_x, sed0_y, "-D", color="#9334e6", linewidth=2.0, markersize=5.5, label="TCP 3-Hop SED (0% FER)")
+
+    ax1.axvline(x_pos[5], color="#5f6368", linestyle=":", linewidth=1.4, label="Spec Max Non-TCP Block Size (1024 B)")
+    ax1.axvspan(x_pos[6] - 0.3, x_pos[8] + 0.3, color="#1a73e8", alpha=0.08, label="TCP LargeBlock Region (2048 B – 8192 B)")
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(x_labels)
+    ax1.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax1.set_ylabel("Total Transfer Duration per 1 KB (s / KB)")
+    ax1.set_title("A. Total Transfer Duration per 1 KB vs. Block Size (0% FER, 1–3 Hops)")
+    ax1.legend(loc="upper right", fontsize=7.3, ncol=2)
+
+    # -------------------------------------------------------------------------
+    # Panel B (Top-Right): Normalized Transfer Duration (s/KB) vs. Block Size (5% FER, 1–3 Hops)
+    # -------------------------------------------------------------------------
+    for hops in (1, 2, 3):
+        col = hop_colors[hops]
+        txs5, tys5 = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in tcp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+            if m:
+                txs5.append(x_pos[idx])
+                tys5.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+        if txs5:
+            ax2.plot(txs5, tys5, "-o", color=col, linewidth=2.2, markersize=6, label=f"TCP {hops}-Hop (5% FER)")
+
+        uxs5, uys5 = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in udp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+            if m:
+                uxs5.append(x_pos[idx])
+                uys5.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+        if uxs5:
+            ax2.plot(uxs5, uys5, "--^", color=col, linewidth=1.7, markersize=5, alpha=0.82, label=f"UDP/MRP {hops}-Hop (5% FER)")
+
+    # Overlay 3-Hop SED TCP (5% FER)
+    sed5_x, sed5_y = [], []
+    for idx, b in enumerate(tcp_block_sizes):
+        m = [r for r in tcp_sed_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+        if m:
+            sed5_x.append(x_pos[idx])
+            sed5_y.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+    if sed5_x:
+        ax2.plot(sed5_x, sed5_y, "-D", color="#9334e6", linewidth=2.0, markersize=5.5, label="TCP 3-Hop SED (5% FER)")
+
+    ax2.axvline(x_pos[5], color="#5f6368", linestyle=":", linewidth=1.4, label="Spec Max Non-TCP Block Size (1024 B)")
+    ax2.axvspan(x_pos[6] - 0.3, x_pos[8] + 0.3, color="#1a73e8", alpha=0.08, label="TCP LargeBlock Region (2048 B – 8192 B)")
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(x_labels)
+    ax2.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax2.set_ylabel("Total Transfer Duration per 1 KB (s / KB)")
+    ax2.set_title("B. Total Transfer Duration per 1 KB Under 5% FER vs. Block Size (1–3 Hops)")
+    ax2.legend(loc="upper right", fontsize=7.3, ncol=2)
+
+    # -------------------------------------------------------------------------
+    # Panel C (Bottom-Left): Per-Block Round-Trip Latency (ms) vs. Block Size (0% & 5% FER)
+    # -------------------------------------------------------------------------
+    for hops in (1, 2, 3):
+        col = hop_colors[hops]
+        txs_r, tys_r = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in tcp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m and m[0]["logs"]["block_rtt_ms"]["mean"] > 0:
+                txs_r.append(x_pos[idx])
+                tys_r.append(float(np.mean([r["logs"]["block_rtt_ms"]["mean"] for r in m])))
+        if txs_r:
+            ax3.plot(txs_r, tys_r, "-o", color=col, linewidth=2.2, markersize=6, label=f"TCP {hops}-Hop Block RTT (0% FER)")
+
+        uxs_r, uys_r = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in udp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m and m[0]["logs"]["block_rtt_ms"]["mean"] > 0:
+                uxs_r.append(x_pos[idx])
+                uys_r.append(float(np.mean([r["logs"]["block_rtt_ms"]["mean"] for r in m])))
+        if uxs_r:
+            ax3.plot(uxs_r, uys_r, "--^", color=col, linewidth=1.7, markersize=5, alpha=0.82, label=f"UDP/MRP {hops}-Hop Block RTT (0% FER)")
+
+    # Overlay 3-Hop 5% FER TCP vs UDP Per-Block Latency
+    t3_5_x, t3_5_y = [], []
+    for idx, b in enumerate(tcp_block_sizes):
+        m = [r for r in tcp_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+        if m and m[0]["logs"]["block_rtt_ms"]["mean"] > 0:
+            t3_5_x.append(x_pos[idx])
+            t3_5_y.append(float(np.mean([r["logs"]["block_rtt_ms"]["mean"] for r in m])))
+    if t3_5_x:
+        ax3.plot(t3_5_x, t3_5_y, "-s", color="#d93025", linewidth=1.9, markersize=5, label="TCP 3-Hop Block RTT (5% FER)")
+
+    ax3.axvline(x_pos[5], color="#5f6368", linestyle=":", linewidth=1.4)
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(x_labels)
+    ax3.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax3.set_ylabel("Mean Per-Block BDX Round-Trip Latency (ms)")
+    ax3.set_title("C. Mean Per-Block BDX Round-Trip Latency (ms) vs. Block Size (64 B – 8192 B)")
+    ax3.legend(loc="upper left", fontsize=7.6, ncol=2)
+
+    # -------------------------------------------------------------------------
+    # Panel D (Bottom-Right): Amortized Block Latency per 1 KB (ms/KB) & 802.15.4 PHY Bytes/KB
+    # -------------------------------------------------------------------------
+    for hops in (1, 2, 3):
+        col = hop_colors[hops]
+        txs_k, tys_k = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in tcp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m and m[0]["block_rtt_ms_per_1kb"] > 0:
+                txs_k.append(x_pos[idx])
+                tys_k.append(float(np.mean([r["block_rtt_ms_per_1kb"] for r in m])))
+        if txs_k:
+            ax4.plot(txs_k, tys_k, "-o", color=col, linewidth=2.2, markersize=6, label=f"TCP {hops}-Hop Amortized RTT (0% FER)")
+
+        uxs_k, uys_k = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in udp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m and m[0]["block_rtt_ms_per_1kb"] > 0:
+                uxs_k.append(x_pos[idx])
+                uys_k.append(float(np.mean([r["block_rtt_ms_per_1kb"] for r in m])))
+        if uxs_k:
+            ax4.plot(uxs_k, uys_k, "--^", color=col, linewidth=1.7, markersize=5, alpha=0.82, label=f"UDP/MRP {hops}-Hop Amortized RTT (0% FER)")
+
+    ax4.axvline(x_pos[5], color="#5f6368", linestyle=":", linewidth=1.4, label="Spec Max Non-TCP Block Size (1024 B)")
+    ax4.axvspan(x_pos[6] - 0.3, x_pos[8] + 0.3, color="#1a73e8", alpha=0.08, label="TCP LargeBlock Region (2048 B – 8192 B)")
+    ax4.set_xticks(x_pos)
+    ax4.set_xticklabels(x_labels)
+    ax4.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax4.set_ylabel("Amortized Per-Block Latency per 1 KB (ms / KB)")
+    ax4.set_title("D. Amortized Block Exchange Latency per 1 KB (ms / KB) vs. Block Size")
+    ax4.legend(loc="upper right", fontsize=7.6, ncol=2)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    out_path = os.path.join(out_dir, "bdx_tcp_vs_udp_duration_and_latency.png")
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def write_report_and_stats(runs: List[Dict[str, Any]], out_dir: str, plot_paths: List[str]) -> Tuple[str, str]:
     """Write bdx_benchmark_stats.json and bdx_otns_benchmark_report.md."""
     stats_payload = {
@@ -1514,7 +1715,7 @@ def write_report_and_stats(runs: List[Dict[str, Any]], out_dir: str, plot_paths:
     with open(stats_path, "w", encoding="utf-8") as f:
         json.dump(stats_payload, f, indent=2)
 
-    s2_runs = [r for r in runs if r["suite"] == "suite2_blocksizes"] or runs
+    s2_runs = [r for r in runs if r["suite"] == "suite2_blocksizes" and r.get("transport", "udp") == "udp"] or runs
     # Build Markdown tables from empirical runs
     suite2_rows = []
     for b in sorted(BLOCK_SIZE_TO_6LOWPAN_FRAGS.keys()):
@@ -1535,6 +1736,46 @@ def write_report_and_stats(runs: List[Dict[str, Any]], out_dir: str, plot_paths:
             f"{_fmt(r3, 'sec_per_1kb', ' s')} | {_fmt(r3_5, 'sec_per_1kb', ' s')} | "
             f"{_fmt(r1, 'phy_bytes_per_1kb', ' B')} | {_fmt(r2, 'phy_bytes_per_1kb', ' B')} | "
             f"{_fmt(r3, 'phy_bytes_per_1kb', ' B')} |"
+        )
+
+    tcp_runs = [r for r in runs if r.get("transport") == "tcp" and r["suite"] in ("suite_tcp", "suite_tcp_blocksizes")]
+    tcp_sed_runs = [r for r in runs if r.get("transport") == "tcp" and r["thread_mode"] == "sed"]
+    tcp_rows = []
+    for b in [64, 128, 224, 340, 512, 1024, 2048, 4096, 8192]:
+        t1_0 = [r for r in tcp_runs if r["hops"] == 1 and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+        t2_0 = [r for r in tcp_runs if r["hops"] == 2 and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+        t3_0 = [r for r in tcp_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+        t3_5 = [r for r in tcp_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+        u3_0 = [r for r in s2_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+        u3_5 = [r for r in s2_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+
+        def _f_dur(rlist: List[Dict[str, Any]]) -> str:
+            if not rlist:
+                return "-"
+            r0 = rlist[0]
+            return f"`{r0['transfer_duration_s']:.2f} s` (`{r0['sec_per_1kb']:.2f} s/KB`)"
+
+        def _f_rtt(rlist: List[Dict[str, Any]]) -> str:
+            if not rlist:
+                return "-"
+            r0 = rlist[0]
+            rtt = r0["logs"]["block_rtt_ms"]
+            return f"`{rtt['mean']:.1f} ms` (`{r0['block_rtt_ms_per_1kb']:.1f} ms/KB`)"
+
+        tcp_rows.append(
+            f"| `{b} B` | {_f_dur(t1_0)} | {_f_dur(t2_0)} | {_f_dur(t3_0)} | {_f_dur(u3_0)} | "
+            f"{_f_dur(t3_5)} | {_f_dur(u3_5)} | {_f_rtt(t1_0)} | {_f_rtt(t3_0)} |"
+        )
+
+    tcp_sed_rows = []
+    for b in [340, 1024, 2048, 4096, 8192]:
+        ts_0 = [r for r in tcp_sed_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+        ts_5 = [r for r in tcp_sed_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+        us_0 = [r for r in runs if r.get("transport", "udp") == "udp" and r["suite"] == "suite1_slide10" and r["hops"] == 3 and r["thread_mode"] == "sed" and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+        us_5 = [r for r in runs if r.get("transport", "udp") == "udp" and r["suite"] == "suite1_slide10" and r["hops"] == 3 and r["thread_mode"] == "sed" and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+        tcp_sed_rows.append(
+            f"| `{b} B` | {_f_dur(ts_0)} | {_f_dur(us_0)} | {_f_dur(ts_5)} | {_f_dur(us_5)} | "
+            f"{_f_rtt(ts_0)} | {_f_rtt(ts_5)} |"
         )
 
     s1_runs = [x for x in runs if x["suite"] == "suite1_slide10"] or [x for x in runs if x["hops"] == 3 and x["block_size"] in (340, 1024)]
@@ -1692,10 +1933,32 @@ All 86 runs programmatically verify `ns.get_rloc16()`, `parent`, and `router tab
 
 ---
 
-## 7. Recommendations for Matter SDK & Specification
+## 7. Suite 5: BDX Over TCP (`64 B`–`8192 B`) vs. BDX Over UDP/MRP (`64 B`–`1024 B`)
 
-1. **Default Thread BDX Block Size (`224 B`–`340 B`, 3–4 6LoWPAN Fragments)**:
-   - Constrain BDX over Thread transfers to `224 B` (3 fragments) or `340 B` (4 fragments) instead of `1024 B` (13 fragments). This reduces 6LoWPAN reassembly vulnerability over multi-hop paths while keeping per-1KB 802.15.4 PHY byte load near the theoretical minimum.
+Per the Matter Core Specification (`OTASoftwareUpdate.adoc` & `TCP_Support.adoc` / PR #72958):
+- Over **non-TCP (UDP/MRP)** transports, `MaxBlockSize` is bounded to `<= 1024 B` (`2^10`).
+- Over **TCP (`kLargePayload`)** transports, `MaxBlockSize` is bounded to `<= 8192 B` (`2^13`), and MRP reliability semantics are disabled (`AllowsLargePayload() == true`).
+- On OpenThread (`TCPlp` over 6LoWPAN), TCP segments are bounded by `MSS_6LOWPAN = 474 B` (`~462 B` TCP payload after options, `5` 6LoWPAN fragments per TCP segment) with a `3695 B` receive window (`OT_TCP_RECEIVE_BUFFER_SIZE_MANY_HOPS = 4157`). Consequently, large BDX blocks (`2048 B`, `4096 B`, `8192 B`) over TCP stream continuously in `5`-fragment `TCPlp` segments without suffering 13-fragment unacknowledged 6LoWPAN reassembly vulnerability or per-1KB application-layer `BlockQuery` stop-and-wait turnarounds.
+
+| BDX Block Size | TCP 1-Hop Duration (`0%` FER) | TCP 2-Hop Duration (`0%` FER) | TCP 3-Hop Duration (`0%` FER) | UDP/MRP 3-Hop Duration (`0%` FER) | TCP 3-Hop Duration (`5%` FER) | UDP/MRP 3-Hop Duration (`5%` FER) | TCP 1-Hop Block RTT (`ms/KB`) | TCP 3-Hop Block RTT (`ms/KB`) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+{chr(10).join(tcp_rows)}
+
+### 7.2 3-Hop Sleepy End Device (SED, `200 ms` Poll Period) — BDX Over TCP vs. BDX Over UDP/MRP
+
+| BDX Block Size | TCP 3-Hop SED (`0%` FER) | UDP/MRP 3-Hop SED (`0%` FER) | TCP 3-Hop SED (`5%` FER) | UDP/MRP 3-Hop SED (`5%` FER) | TCP 3-Hop SED Block RTT (`0%` FER) | TCP 3-Hop SED Block RTT (`5%` FER) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+{chr(10).join(tcp_sed_rows)}
+
+![BDX Over TCP vs. BDX Over UDP/MRP Transfer Duration and Per-Block Latency](bdx_tcp_vs_udp_duration_and_latency.png)
+
+---
+
+## 8. Recommendations for Matter SDK & Specification
+
+1. **Default Thread BDX Block Size (`224 B`–`340 B` for UDP/MRP; `4096 B`–`8192 B` for BDX over TCP)**:
+   - Over **UDP/MRP**, constrain BDX over Thread transfers to `224 B` (3 fragments) or `340 B` (4 fragments) instead of `1024 B` (13 fragments) to minimize 6LoWPAN reassembly vulnerability over multi-hop paths.
+   - Over **TCP (`TCPlp`)**, use `4096 B`–`8192 B` BDX blocks: OpenThread `TCPlp` automatically segments blocks into `474 B` (`5`-fragment) TCP segments while streaming across the receive window and eliminating per-1KB `BlockQuery` round-trip turnarounds and `BdxOtaSender` timer quantization.
 2. **Fix Linux OpenThread MRP Default Configuration (`src/messaging/ReliableMessageProtocolConfig.h`)**:
    - Remove `&& !CHIP_DEVICE_LAYER_TARGET_LINUX` from `#if CHIP_ENABLE_OPENTHREAD` in `ReliableMessageProtocolConfig.h:54` (or use `CHIP_SYSTEM_CONFIG_USE_OPENTHREAD_ENDPOINT`) so Linux/POSIX OpenThread nodes advertise Thread-appropriate MRP intervals (`SAI >= 2000 ms, SII >= 5000 ms`) rather than Wi-Fi/Ethernet intervals (`SAI = 300 ms, SII = 500 ms`).
 """
@@ -1740,7 +2003,8 @@ def main() -> int:
     p3 = plot_slide10_multihop_comparison(runs, work_out_dir)
     p4 = plot_scenario1_latency_and_mrp_retries(runs, work_out_dir)
     p5 = plot_scenario2_router_contention(runs, work_out_dir)
-    plot_paths = [p1, p2, p3, p4, p5]
+    p6 = plot_tcp_vs_udp_duration_and_latency(runs, work_out_dir)
+    plot_paths = [p1, p2, p3, p4, p5, p6]
 
     stats_path, report_path = write_report_and_stats(runs, work_out_dir, plot_paths)
 
