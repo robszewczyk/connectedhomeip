@@ -31,3 +31,4 @@ matter_log_json_payload_decode_full = true
 matter_log_json_payload_hex = true
 
 openthread_config_dns_client_enable = true
+openthread_config_tcp_enable = true

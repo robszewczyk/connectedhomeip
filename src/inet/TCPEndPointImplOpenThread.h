@@ -63,8 +63,36 @@ private:
     void DoCloseImpl(CHIP_ERROR err, State oldState) override;
 
     InterfaceId mBoundIntfId;
-    uint16_t mBoundPort;
-    otInstance * mOTInstance = nullptr;
+    IPAddress mBoundAddr = IPAddress::Any;
+    uint16_t mBoundPort  = 0;
+
+    CHIP_ERROR InitEndpoint();
+    otInstance * GetOtInstance() const;
+
+    static void HandleTcpEstablishedCallback(otTcpEndpoint * aEndpoint);
+    static void HandleTcpSendDoneCallback(otTcpEndpoint * aEndpoint, otLinkedBuffer * aData);
+    static void HandleTcpReceiveAvailableCallback(otTcpEndpoint * aEndpoint, size_t aBytesAvailable, bool aEndOfStream,
+                                                  size_t aBytesRemaining);
+    static void HandleTcpDisconnectedCallback(otTcpEndpoint * aEndpoint, otTcpDisconnectedReason aReason);
+    static otTcpIncomingConnectionAction HandleTcpAcceptReadyCallback(otTcpListener * aListener, const otSockAddr * aPeer,
+                                                                      otTcpEndpoint ** aAcceptInto);
+    static void HandleTcpAcceptDoneCallback(otTcpListener * aListener, otTcpEndpoint * aEndpoint, const otSockAddr * aPeer);
+
+    static constexpr size_t kMaxPendingSends = 8;
+    struct PendingSend
+    {
+        otLinkedBuffer mLinkedBuffer;
+        System::PacketBufferHandle mBuffer;
+        bool mInUse = false;
+    };
+
+    otTcpEndpoint mEndpoint;
+    otTcpListener mListener;
+    bool mIsEndpointInitialized = false;
+    bool mIsListenerInitialized = false;
+    uint8_t mReceiveBuffer[OT_TCP_RECEIVE_BUFFER_SIZE_MANY_HOPS];
+    PendingSend mPendingSends[kMaxPendingSends];
+    TCPEndPointHandle mPendingAcceptEndPoint;
 };
 
 using TCPEndPointImpl = TCPEndPointImplOT;
