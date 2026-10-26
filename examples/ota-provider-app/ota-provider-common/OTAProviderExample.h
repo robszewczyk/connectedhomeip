@@ -47,6 +47,7 @@ public:
     static constexpr size_t kUriMaxLen               = 256;
     static constexpr size_t kMaxLocation             = 3;
     static constexpr size_t kMaxProtocolsSupported   = 4;
+    static constexpr size_t kMaxConcurrentBdxSenders = 16;
     // Update token is up to 32 bytes; hex-encoded string needs 2 chars per byte + null terminator.
     static constexpr size_t kUpdateTokenStrLen = 65;
 
@@ -80,7 +81,7 @@ public:
     //////////// OTAProviderExample public APIs ///////////////
     void SetOTAFilePath(const char * path);
     void SetImageUri(const char * imageUri);
-    BdxOtaSender * GetBdxOtaSender() { return &mBdxOtaSender; }
+    BdxOtaSender * GetBdxOtaSender() { return &mBdxOtaSenders[0]; }
 
     void SetOTACandidates(std::vector<OTAProviderExample::DeviceSoftwareVersionModel> candidates);
     void SetIgnoreQueryImageCount(uint32_t count) { mIgnoreQueryImageCount = count; }
@@ -167,8 +168,9 @@ private:
     SaveCommandSnapshot(const chip::app::Clusters::OtaSoftwareUpdateProvider::Commands::QueryImage::DecodableType & commandData);
 
     std::string MapFileToDesignator(const std::string & filePath);
+    BdxOtaSender * AcquireBdxOtaSender(chip::FabricIndex fabricIndex, chip::NodeId nodeId);
 
-    BdxOtaSender mBdxOtaSender;
+    BdxOtaSender mBdxOtaSenders[kMaxConcurrentBdxSenders];
     std::vector<DeviceSoftwareVersionModel> mCandidates;
     std::unordered_map<std::string, std::string> mFileDesignatorMap;
     std::string mSelectedFileDesignator;

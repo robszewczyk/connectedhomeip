@@ -35,10 +35,35 @@ public:
 
     void SetFileDesignatorMap(const std::unordered_map<std::string, std::string> & map) { mFileDesignatorMap = map; }
 
+    bool IsInitialized() const { return mInitialized; }
+
+    bool MatchesSession(chip::FabricIndex fabricIndex, chip::NodeId nodeId) const
+    {
+        return mInitialized && mFabricIndex.HasValue() && mFabricIndex.Value() == fabricIndex && mNodeId.HasValue() &&
+            mNodeId.Value() == nodeId;
+    }
+
+    void SetPeerPool(BdxOtaSender * pool, size_t poolSize)
+    {
+        mPeerPool     = pool;
+        mPeerPoolSize = poolSize;
+    }
+
+    CHIP_ERROR OnUnsolicitedMessageReceived(const chip::PayloadHeader & payloadHeader,
+                                            chip::Messaging::ExchangeDelegate *& newDelegate) override
+    {
+        newDelegate = this;
+        return CHIP_NO_ERROR;
+    }
+
+    CHIP_ERROR OnUnsolicitedMessageReceived(const chip::PayloadHeader & payloadHeader, const chip::SessionHandle & session,
+                                            chip::Messaging::ExchangeDelegate *& newDelegate) override;
+
 protected:
     // Inherited from bdx::TransferFacilitator
     CHIP_ERROR OnMessageReceived(chip::Messaging::ExchangeContext * ec, const chip::PayloadHeader & payloadHeader,
                                  chip::System::PacketBufferHandle && payload) override final;
+    void OnResponseTimeout(chip::Messaging::ExchangeContext * ec) override;
 
 private:
     // Inherited from bdx::TransferFacilitator
@@ -56,4 +81,7 @@ private:
     chip::Optional<chip::FabricIndex> mFabricIndex;
 
     chip::Optional<chip::NodeId> mNodeId;
+
+    BdxOtaSender * mPeerPool = nullptr;
+    size_t mPeerPoolSize     = 0;
 };

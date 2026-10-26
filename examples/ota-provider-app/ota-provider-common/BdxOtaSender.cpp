@@ -62,6 +62,27 @@ CHIP_ERROR BdxOtaSender::InitializeTransfer(chip::FabricIndex fabricIndex, chip:
     return CHIP_NO_ERROR;
 }
 
+CHIP_ERROR BdxOtaSender::OnUnsolicitedMessageReceived(const chip::PayloadHeader & payloadHeader,
+                                                      const chip::SessionHandle & session,
+                                                      chip::Messaging::ExchangeDelegate *& newDelegate)
+{
+    if (mPeerPool != nullptr && session->IsSecureSession())
+    {
+        chip::FabricIndex fabricIndex = session->GetFabricIndex();
+        chip::NodeId nodeId           = session->GetPeer().GetNodeId();
+        for (size_t i = 0; i < mPeerPoolSize; ++i)
+        {
+            if (mPeerPool[i].MatchesSession(fabricIndex, nodeId))
+            {
+                newDelegate = &mPeerPool[i];
+                return CHIP_NO_ERROR;
+            }
+        }
+    }
+    newDelegate = this;
+    return CHIP_NO_ERROR;
+}
+
 CHIP_ERROR BdxOtaSender::OnMessageReceived(chip::Messaging::ExchangeContext * ec, const chip::PayloadHeader & payloadHeader,
                                            chip::System::PacketBufferHandle && payload)
 {
@@ -79,6 +100,14 @@ CHIP_ERROR BdxOtaSender::OnMessageReceived(chip::Messaging::ExchangeContext * ec
                         CHIP_ERROR_INVALID_DESTINATION_NODE_ID);
 
     return chip::bdx::TransferFacilitator::OnMessageReceived(ec, payloadHeader, std::move(payload));
+}
+
+void BdxOtaSender::OnResponseTimeout(chip::Messaging::ExchangeContext * ec)
+{
+    ChipLogError(BDX, "OnResponseTimeout for node 0x" ChipLogFormatX64 ", ec: " ChipLogFormatExchange,
+                 ChipLogValueX64(mNodeId.ValueOr(chip::kUndefinedNodeId)), ChipLogValueExchange(ec));
+    mExchangeCtx = nullptr;
+    Reset();
 }
 
 void BdxOtaSender::HandleTransferSessionOutput(TransferSession::OutputEvent & event)
@@ -139,6 +168,8 @@ void BdxOtaSender::HandleTransferSessionOutput(TransferSession::OutputEvent & ev
         acceptData.Length       = mTransfer.GetTransferLength();
         VerifyOrReturn(mTransfer.AcceptTransfer(acceptData) == CHIP_NO_ERROR,
                        ChipLogError(BDX, "AcceptTransfer failed: %" CHIP_ERROR_FORMAT, err.Format()));
+        ChipLogDetail(BDX, "ReceiveInit accepted for node 0x" ChipLogFormatX64 " maxBlockSize=%u",
+                      ChipLogValueX64(mNodeId.ValueOr(chip::kUndefinedNodeId)), acceptData.MaxBlockSize);
 
         // Store the file designator used during block query
         uint16_t fdl       = 0;
@@ -235,7 +266,8 @@ void BdxOtaSender::HandleTransferSessionOutput(TransferSession::OutputEvent & ev
     case TransferSession::OutputEventType::kAckReceived:
         break;
     case TransferSession::OutputEventType::kAckEOFReceived:
-        ChipLogDetail(BDX, "Transfer completed, got AckEOF");
+        ChipLogDetail(BDX, "Transfer completed, got AckEOF from node 0x" ChipLogFormatX64,
+                      ChipLogValueX64(mNodeId.ValueOr(chip::kUndefinedNodeId)));
         Reset();
         break;
     case TransferSession::OutputEventType::kStatusReceived:
@@ -281,6 +313,19 @@ void BdxOtaSender::Reset()
 
 void BdxOtaSender::AbortTransfer()
 {
+    if (mPeerPool != nullptr)
+    {
+        for (size_t i = 0; i < mPeerPoolSize; ++i)
+        {
+            if (mPeerPool[i].mInitialized)
+            {
+                TEMPORARY_RETURN_IGNORED mPeerPool[i].mTransfer.AbortTransfer(StatusCode::kUnknown);
+                mPeerPool[i].PollForOutput();
+            }
+        }
+        return;
+    }
+
     if (mInitialized)
     {
         TEMPORARY_RETURN_IGNORED mTransfer.AbortTransfer(StatusCode::kUnknown);

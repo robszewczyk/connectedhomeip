@@ -103,6 +103,26 @@ OTAProviderExample::OTAProviderExample()
     mPollInterval              = kBdxServerPollIntervalMillis;
     mMaxBDXBlockSize           = kMaxBdxBlockSize;
     mCandidates.clear();
+    mBdxOtaSenders[0].SetPeerPool(mBdxOtaSenders, kMaxConcurrentBdxSenders);
+}
+
+BdxOtaSender * OTAProviderExample::AcquireBdxOtaSender(chip::FabricIndex fabricIndex, chip::NodeId nodeId)
+{
+    for (auto & sender : mBdxOtaSenders)
+    {
+        if (sender.MatchesSession(fabricIndex, nodeId))
+        {
+            return &sender;
+        }
+    }
+    for (auto & sender : mBdxOtaSenders)
+    {
+        if (!sender.IsInitialized())
+        {
+            return &sender;
+        }
+    }
+    return nullptr;
 }
 
 // Called when a single OTA image file is provided directly (not via candidates/image list)
@@ -113,14 +133,20 @@ void OTAProviderExample::SetOTAFilePath(const char * path)
         mFileDesignatorMap.clear();
         mSelectedFileDesignator = MapFileToDesignator(path);
         // BdxOtaSender needs its own copy to resolve designators during transfer
-        mBdxOtaSender.SetFileDesignatorMap(mFileDesignatorMap);
+        for (auto & sender : mBdxOtaSenders)
+        {
+            sender.SetFileDesignatorMap(mFileDesignatorMap);
+        }
     }
     else
     {
         mFileDesignatorMap.clear();
         mSelectedFileDesignator.clear();
         // Keep BdxOtaSender's internal map in sync when clearing the path
-        mBdxOtaSender.SetFileDesignatorMap(mFileDesignatorMap);
+        for (auto & sender : mBdxOtaSenders)
+        {
+            sender.SetFileDesignatorMap(mFileDesignatorMap);
+        }
     }
 }
 
@@ -176,7 +202,10 @@ void OTAProviderExample::SetOTACandidates(std::vector<OTAProviderExample::Device
         // Generate a file designator for this candidate's OTA file
         candidate.otaFileDesignator = MapFileToDesignator(candidate.otaURL);
     }
-    mBdxOtaSender.SetFileDesignatorMap(mFileDesignatorMap);
+    for (auto & sender : mBdxOtaSenders)
+    {
+        sender.SetFileDesignatorMap(mFileDesignatorMap);
+    }
 }
 
 static bool CompareSoftwareVersions(const OTAProviderExample::DeviceSoftwareVersionModel & a,
@@ -321,12 +350,15 @@ void OTAProviderExample::SendQueryImageResponse(app::CommandHandler * commandObj
         // Initialize the transfer session in prepartion for a BDX transfer
         BitFlags<TransferControlFlags> bdxFlags;
         bdxFlags.Set(TransferControlFlags::kReceiverDrive);
-        if (mBdxOtaSender.InitializeTransfer(commandObj->GetSubjectDescriptor().fabricIndex,
-                                             commandObj->GetSubjectDescriptor().subject) == CHIP_NO_ERROR)
+        BdxOtaSender * bdxSender =
+            AcquireBdxOtaSender(commandObj->GetSubjectDescriptor().fabricIndex, commandObj->GetSubjectDescriptor().subject);
+        if (bdxSender != nullptr &&
+            bdxSender->InitializeTransfer(commandObj->GetSubjectDescriptor().fabricIndex,
+                                          commandObj->GetSubjectDescriptor().subject) == CHIP_NO_ERROR)
         {
             CHIP_ERROR error =
-                mBdxOtaSender.PrepareForTransfer(&chip::DeviceLayer::SystemLayer(), chip::bdx::TransferRole::kSender, bdxFlags,
-                                                 mMaxBDXBlockSize, kBdxTimeout, chip::System::Clock::Milliseconds32(mPollInterval));
+                bdxSender->PrepareForTransfer(&chip::DeviceLayer::SystemLayer(), chip::bdx::TransferRole::kSender, bdxFlags,
+                                              mMaxBDXBlockSize, kBdxTimeout, chip::System::Clock::Milliseconds32(mPollInterval));
             if (error != CHIP_NO_ERROR)
             {
                 ChipLogError(SoftwareUpdate, "Cannot prepare for transfer: %" CHIP_ERROR_FORMAT, error.Format());
@@ -341,7 +373,7 @@ void OTAProviderExample::SendQueryImageResponse(app::CommandHandler * commandObj
         }
         else
         {
-            // Another BDX transfer in progress
+            // All BDX transfer slots are in progress
             mQueryImageStatus = OTAQueryStatus::kBusy;
         }
     }
