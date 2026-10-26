@@ -243,7 +243,7 @@ def discover_short_to_ext(run_dir: str, manifest: Dict[str, Any]) -> Dict[int, b
     return short_to_ext
 
 
-def parse_pcap_802154(run_dir: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
+def parse_pcap_802154(run_dir: str, manifest: Dict[str, Any], min_sim_ts_s: float = 0.0) -> Dict[str, Any]:
     """Decrypt 802.15.4 frames in pcap/current.pcap and compute 6LoWPAN fragmentation & hop load metrics."""
     pcap_path = os.path.join(run_dir, "pcap", "current.pcap")
     result: Dict[str, Any] = {
@@ -261,6 +261,20 @@ def parse_pcap_802154(run_dir: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         "iphc_unfragmented_frames": 0,
         "datagram_frag_counts": [],
         "hop_transmissions_by_src_rloc": {},
+        "provider_otbr_mac_frames": 0,
+        "provider_otbr_mac_bytes": 0,
+        "provider_otbr_phy_bytes": 0,
+        "provider_otbr_6lowpan_mesh_hdr_bytes": 0,
+        "provider_otbr_6lowpan_frag_hdr_bytes": 0,
+        "provider_otbr_6lowpan_total_hdr_bytes": 0,
+        "provider_otbr_mac_sec_fcs_hdr_bytes": 0,
+        "provider_otbr_phy_hdr_bytes": 0,
+        "downlink_2hop_mac_frames": 0,
+        "downlink_2hop_mac_bytes": 0,
+        "downlink_2hop_phy_bytes": 0,
+        "downlink_2hop_6lowpan_total_hdr_bytes": 0,
+        "downlink_2hop_mac_sec_fcs_hdr_bytes": 0,
+        "downlink_2hop_phy_hdr_bytes": 0,
     }
     if not os.path.isfile(pcap_path) or result["pcap_size_bytes"] < 24:
         return result
@@ -270,6 +284,19 @@ def parse_pcap_802154(run_dir: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
     mac_key = digest[16:32]
     aesccm = AESCCM(mac_key, tag_length=4)
     short_to_ext = discover_short_to_ext(run_dir, manifest)
+
+    vtopo = manifest.get("verified_topology", {})
+    otbr_rloc_str = vtopo.get("otbr", {}).get("rloc16", "0x4800")
+    try:
+        otbr_rloc = int(otbr_rloc_str, 16)
+    except ValueError:
+        otbr_rloc = 0x4800
+    router_rlocs = set()
+    for r_info in vtopo.get("routers", []):
+        try:
+            router_rlocs.add(int(r_info.get("rloc16", "0xfffe"), 16))
+        except ValueError:
+            pass
 
     with open(pcap_path, "rb") as f:
         pcap_data = f.read()
@@ -281,6 +308,7 @@ def parse_pcap_802154(run_dir: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
     off = 24
     while off + 16 <= len(pcap_data):
         _ts_sec, _ts_usec, incl_len, _orig_len = struct.unpack("<IIII", pcap_data[off : off + 16])
+        sim_ts_s = _ts_sec + _ts_usec * 1e-6
         off += 16
         frame = pcap_data[off : off + incl_len]
         off += incl_len
@@ -324,32 +352,55 @@ def parse_pcap_802154(run_dir: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
             pt = aesccm.decrypt(nonce, frame[15:-2], frame[:15])
             result["decrypted_frames"] += 1
             hdr = pt
+            mesh_hdr_len = 0
+            orig_short = src_short
             # Skip 5-byte (or 6-byte with Deep Hops Left when HopsLeft == 0xF) RFC 4944 6LoWPAN Mesh Header
             if len(hdr) >= 5 and (hdr[0] & 0xC0) == 0x80:
                 result["mesh_header_frames"] += 1
                 mesh_hdr_len = 6 if (hdr[0] & 0x0F) == 0x0F else 5
                 if len(hdr) >= mesh_hdr_len:
+                    orig_short = struct.unpack(">H", hdr[mesh_hdr_len - 4 : mesh_hdr_len - 2])[0]
                     hdr = hdr[mesh_hdr_len:]
-            if not hdr:
-                continue
-            disp = hdr[0]
-            if (disp & 0xF8) == 0xC0 and len(hdr) >= 4:
-                result["frag1_frames"] += 1
-                dsize = ((hdr[0] & 0x07) << 8) | hdr[1]
-                dtag = struct.unpack(">H", hdr[2:4])[0]
-                if dsize >= 140:
-                    key = (src_short, dst_short, dtag, dsize)
-                    dgram_unique_offsets.setdefault(key, set()).add(0)
-            elif (disp & 0xF8) == 0xE0 and len(hdr) >= 5:
-                result["fragn_frames"] += 1
-                dsize = ((hdr[0] & 0x07) << 8) | hdr[1]
-                dtag = struct.unpack(">H", hdr[2:4])[0]
-                doff = hdr[4]
-                if dsize >= 140:
-                    key = (src_short, dst_short, dtag, dsize)
-                    dgram_unique_offsets.setdefault(key, set()).add(doff)
-            elif (disp & 0xE0) == 0x60:
-                result["iphc_unfragmented_frames"] += 1
+            frag_hdr_len = 0
+            if hdr:
+                disp = hdr[0]
+                if (disp & 0xF8) == 0xC0 and len(hdr) >= 4:
+                    result["frag1_frames"] += 1
+                    frag_hdr_len = 4
+                    dsize = ((hdr[0] & 0x07) << 8) | hdr[1]
+                    dtag = struct.unpack(">H", hdr[2:4])[0]
+                    if dsize >= 140:
+                        key = (src_short, dst_short, dtag, dsize)
+                        dgram_unique_offsets.setdefault(key, set()).add(0)
+                elif (disp & 0xF8) == 0xE0 and len(hdr) >= 5:
+                    result["fragn_frames"] += 1
+                    frag_hdr_len = 5
+                    dsize = ((hdr[0] & 0x07) << 8) | hdr[1]
+                    dtag = struct.unpack(">H", hdr[2:4])[0]
+                    doff = hdr[4]
+                    if dsize >= 140:
+                        key = (src_short, dst_short, dtag, dsize)
+                        dgram_unique_offsets.setdefault(key, set()).add(doff)
+                elif (disp & 0xE0) == 0x60:
+                    result["iphc_unfragmented_frames"] += 1
+
+            if sim_ts_s >= min_sim_ts_s:
+                if src_short == otbr_rloc and (not router_rlocs or dst_short in router_rlocs or orig_short == otbr_rloc):
+                    result["provider_otbr_mac_frames"] += 1
+                    result["provider_otbr_mac_bytes"] += len(frame)
+                    result["provider_otbr_phy_bytes"] += len(frame) + 6
+                    result["provider_otbr_6lowpan_mesh_hdr_bytes"] += mesh_hdr_len
+                    result["provider_otbr_6lowpan_frag_hdr_bytes"] += frag_hdr_len
+                    result["provider_otbr_6lowpan_total_hdr_bytes"] += mesh_hdr_len + frag_hdr_len
+                    result["provider_otbr_mac_sec_fcs_hdr_bytes"] += 21
+                    result["provider_otbr_phy_hdr_bytes"] += 6
+                if orig_short == otbr_rloc and (src_short == otbr_rloc or src_short in router_rlocs):
+                    result["downlink_2hop_mac_frames"] += 1
+                    result["downlink_2hop_mac_bytes"] += len(frame)
+                    result["downlink_2hop_phy_bytes"] += len(frame) + 6
+                    result["downlink_2hop_6lowpan_total_hdr_bytes"] += mesh_hdr_len + frag_hdr_len
+                    result["downlink_2hop_mac_sec_fcs_hdr_bytes"] += 21
+                    result["downlink_2hop_phy_hdr_bytes"] += 6
         except Exception:
             pass
 
@@ -379,10 +430,15 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
         msg_tx_ts: Dict[int, float] = {}
         msg_last_ts: Dict[int, float] = {}
         msg_retry_cnt: Dict[int, int] = {}
-        block_tx_by_exch: Dict[str, Tuple[float, int]] = {}
+        msg_info_by_mc: Dict[int, Tuple[str, int]] = {}
+        block_tx_by_exch: Dict[str, Tuple[float, int, str]] = {}
+        provider_matter_bdx_initial_bytes = 0
+        provider_matter_bdx_retx_bytes = 0
+        provider_matter_setup_bytes = 0
+        provider_matter_setup_retx_bytes = 0
 
         tx_re = re.compile(
-            r"\[(?P<ts>\d+\.\d+)\].*(?:<<<|<<5)\s+\[E:(?P<exch>\S+)\s+S:\S+\s+M:(?P<m>[0-9a-fA-F]+)(?:\s+\(Ack:[^)]+\))?\].*Msg TX.*Type (?P<type>\S+)\s+\((?P<name>[^)]+)\)"
+            r"\[(?P<ts>\d+\.\d+)\].*(?:<<<|<<5)\s+\[E:(?P<exch>\S+)\s+S:\S+\s+M:(?P<m>[0-9a-fA-F]+)(?:\s+\(Ack:[^)]+\))?\].*Msg TX.*Type (?P<type>\S+)\s+\((?P<name>[^)]+)\)(?:\s+\(B:(?P<blen>\d+)\))?"
         )
         rx_re = re.compile(
             r"\[(?P<ts>\d+\.\d+)\].*(?:>>>|>>5)\s+\[E:(?P<exch>\S+)\s+S:\S+\s+M:(?P<m>[0-9a-fA-F]+)(?:\s+\(Ack:[^)]+\))?\].*Msg RX.*Type (?P<type>\S+)\s+\((?P<name>[^)]+)\)"
@@ -403,9 +459,15 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
                 exch = m_tx.group("exch")
                 mc = int(m_tx.group("m"), 16) if any(c in "abcdefABCDEF" for c in m_tx.group("m")) else int(m_tx.group("m"))
                 mname = m_tx.group("name")
+                blen = int(m_tx.group("blen")) if m_tx.group("blen") else 0
                 msg_tx_ts[mc] = ts
                 msg_last_ts[mc] = ts
                 msg_retry_cnt[mc] = 0
+                msg_info_by_mc[mc] = (mname, blen)
+                if mname in ("BDX:Block", "BDX:BlockEOF"):
+                    provider_matter_bdx_initial_bytes += blen
+                else:
+                    provider_matter_setup_bytes += blen
                 if mname in ("BDX:ReceiveAccept", "BDX:Block", "BDX:BlockEOF"):
                     if mname in ("BDX:Block", "BDX:BlockEOF"):
                         block_tx_by_exch[exch] = (ts, mc, mname)
@@ -436,6 +498,12 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
                     mrp_retry_intervals_ms.setdefault(min(cnt, 4), []).append(round(dt_ms, 2))
                 msg_last_ts[mc] = ts
                 msg_retry_cnt[mc] = cnt
+                if m_retx.group("cnt") is not None:
+                    mname_rt, blen_rt = msg_info_by_mc.get(mc, ("unknown", 0))
+                    if mname_rt in ("BDX:Block", "BDX:BlockEOF"):
+                        provider_matter_bdx_retx_bytes += blen_rt
+                    else:
+                        provider_matter_setup_retx_bytes += blen_rt
                 bdx_events_timeline.append({"t_rel_s": round(ts - t0, 4), "event": f"MRP_Retry_{cnt}", "dir": "RETX"})
                 continue
 
@@ -476,6 +544,9 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
     # Parse OpenThread MeshForwarder & Mac counters per node (and router A1 timeline events)
     node_mac_stats: Dict[str, Dict[str, int]] = {}
     router_a1_events_timeline: List[Dict[str, Any]] = []
+    provider_ipv6_unicast_bytes = 0
+    provider_ipv6_unicast_pkts = 0
+    t_first_provider_5540_s = 0.0
     for n_meta in manifest.get("nodes", []):
         oid = n_meta["otns_id"]
         role = n_meta["role"]
@@ -502,10 +573,30 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
             start_idx = win_indices[-1] + 1 if win_indices else 0
             us0: Optional[int] = None
             base_offset_s = (win_start_epoch - t0) if (win_start_epoch is not None and t0 is not None) else 0.0
+            cur_ip_us = 0
+            cur_ip_len = 0
+            cur_ip_dst = 0
             for line in lines[start_idx:]:
                 m_us = re.match(r"^\s*(\d+)\s+\d+:\d+:\d+\.\d+", line)
                 if m_us and us0 is None:
                     us0 = int(m_us.group(1))
+                if oid == 1:
+                    m_ip = re.search(
+                        r"^\s*(\d+)\s+\S+\s+\[I\]\s+MeshForwarder-:\s+Sent IPv6 (?:UDP|TCP) msg, len:(\d+).*to:0x([0-9a-fA-F]+)",
+                        line,
+                    )
+                    if m_ip:
+                        cur_ip_us = int(m_ip.group(1))
+                        cur_ip_len = int(m_ip.group(2))
+                        cur_ip_dst = int(m_ip.group(3), 16)
+                    m_src = re.search(r"MeshForwarder-:\s+src:(\S+)", line)
+                    if m_src and cur_ip_dst != 0xFFFF and cur_ip_len > 0:
+                        if m_src.group(1).endswith(":5540"):
+                            if t_first_provider_5540_s == 0.0:
+                                t_first_provider_5540_s = max(0.0, (cur_ip_us / 1e6) - 0.05)
+                            provider_ipv6_unicast_bytes += cur_ip_len
+                            provider_ipv6_unicast_pkts += 1
+                        cur_ip_len = 0
                 if "Sent IPv6 UDP msg" in line:
                     counts["udp_tx"] += 1
                 elif "Received IPv6 UDP msg" in line:
@@ -592,6 +683,18 @@ def parse_provider_and_node_logs(run_dir: str, manifest: Dict[str, Any]) -> Dict
         "retries_per_block_series": retries_per_block,
         "retries_per_block_histogram": retry_hist,
         "total_mrp_retries": int(sum(retries_per_block)),
+        "provider_matter_bdx_initial_bytes": provider_matter_bdx_initial_bytes,
+        "provider_matter_bdx_retx_bytes": provider_matter_bdx_retx_bytes,
+        "provider_matter_setup_bytes": provider_matter_setup_bytes + provider_matter_setup_retx_bytes,
+        "provider_matter_total_bytes": (
+            provider_matter_bdx_initial_bytes
+            + provider_matter_bdx_retx_bytes
+            + provider_matter_setup_bytes
+            + provider_matter_setup_retx_bytes
+        ),
+        "provider_ipv6_unicast_bytes": provider_ipv6_unicast_bytes,
+        "provider_ipv6_unicast_pkts": provider_ipv6_unicast_pkts,
+        "t_first_provider_5540_s": round(t_first_provider_5540_s, 4),
         "node_mac_stats": node_mac_stats,
         "bdx_events_timeline": bdx_events_timeline[:400],
         "router_a1_events_timeline": router_a1_events_timeline[:500],
@@ -615,12 +718,20 @@ def analyze_all_bdx_runs(sim_logs_dir: str) -> List[Dict[str, Any]]:
         if "suite" not in manifest or "block_size" not in manifest:
             continue
 
-        pcap_stats = parse_pcap_802154(run_dir, manifest)
         log_stats = parse_provider_and_node_logs(run_dir, manifest)
+        pcap_stats = parse_pcap_802154(run_dir, manifest, min_sim_ts_s=log_stats.get("t_first_provider_5540_s", 0.0))
 
+        tmetrics = manifest.get("transfer_metrics", {})
+        num_requestors = max(1, int(manifest.get("num_requestors", tmetrics.get("num_requestors", 1))))
         img_bytes = max(1, int(manifest.get("image_size_bytes", 16384)))
-        img_kb = img_bytes / 1024.0
-        dur_s = float(manifest.get("transfer_metrics", {}).get("transfer_duration_s", manifest.get("duration_sec", 1.0)))
+        total_payload_bytes = num_requestors * img_bytes
+        img_kb = total_payload_bytes / 1024.0
+        dur_s = float(tmetrics.get("transfer_duration_s", manifest.get("duration_sec", 1.0)))
+        per_req = tmetrics.get("per_requestor_metrics", {})
+        req_durs = [float(v.get("transfer_duration_s", dur_s)) for v in per_req.values() if v.get(" transfer_duration_s") is not None or v.get("transfer_duration_s") is not None]
+        min_node_dur_s = min(req_durs) if req_durs else dur_s
+        mean_node_dur_s = float(np.mean(req_durs)) if req_durs else dur_s
+        max_node_dur_s = max(req_durs) if req_durs else dur_s
         sec_per_1kb = dur_s / img_kb
         proj_882kb_min = (sec_per_1kb * 882.0) / 60.0
         proj_1620kb_min = (sec_per_1kb * 1620.0) / 60.0
@@ -628,6 +739,47 @@ def analyze_all_bdx_runs(sim_logs_dir: str) -> List[Dict[str, Any]]:
         phy_bytes_per_1kb = pcap_stats["total_phy_bytes"] / img_kb
         mac_bytes_per_1kb = pcap_stats["total_mac_bytes"] / img_kb
         frames_per_1kb = pcap_stats["total_frames"] / img_kb
+
+        scale_1mb = 1048576.0 / float(img_bytes)
+        raw_1mb_payload_bytes = int(num_requestors * 1048576)
+        bdx_init_b = int(log_stats.get("provider_matter_bdx_initial_bytes", 0))
+        bdx_retx_b = int(log_stats.get("provider_matter_bdx_retx_bytes", 0))
+        setup_b = int(log_stats.get("provider_matter_setup_bytes", 0))
+        ipv6_b = int(log_stats.get("provider_ipv6_unicast_bytes", 0))
+        otbr_mac_b = int(pcap_stats.get("provider_otbr_mac_bytes", 0))
+        otbr_phy_b = int(pcap_stats.get("provider_otbr_phy_bytes", 0))
+        otbr_6lo_mesh_b = int(pcap_stats.get("provider_otbr_6lowpan_mesh_hdr_bytes", 0))
+        otbr_6lo_frag_b = int(pcap_stats.get("provider_otbr_6lowpan_frag_hdr_bytes", 0))
+        otbr_6lo_tot_b = int(pcap_stats.get("provider_otbr_6lowpan_total_hdr_bytes", 0))
+        otbr_mac_hdr_b = int(pcap_stats.get("provider_otbr_mac_sec_fcs_hdr_bytes", 0))
+        otbr_phy_hdr_b = int(pcap_stats.get("provider_otbr_phy_hdr_bytes", 0))
+        dl2_mac_b = int(pcap_stats.get("downlink_2hop_mac_bytes", 0))
+        dl2_phy_b = int(pcap_stats.get("downlink_2hop_phy_bytes", 0))
+        dl2_6lo_b = int(pcap_stats.get("downlink_2hop_6lowpan_total_hdr_bytes", 0))
+
+        provider_1mb_breakdown = {
+            "num_requestors": num_requestors,
+            "raw_payload_bytes": raw_1mb_payload_bytes,
+            "projected_duration_s": round(dur_s * scale_1mb, 2),
+            "projected_duration_min": round((dur_s * scale_1mb) / 60.0, 2),
+            "min_node_duration_min": round((min_node_dur_s * scale_1mb) / 60.0, 2),
+            "mean_node_duration_min": round((mean_node_dur_s * scale_1mb) / 60.0, 2),
+            "max_node_duration_min": round((max_node_dur_s * scale_1mb) / 60.0, 2),
+            "provider_matter_total_bytes": int(round(setup_b + scale_1mb * (bdx_init_b + bdx_retx_b))),
+            "provider_matter_bdx_hdr_bytes": int(round(scale_1mb * max(0, bdx_init_b - num_requestors * (img_bytes + 88)))),
+            "provider_matter_retx_bytes": int(round(scale_1mb * bdx_retx_b)),
+            "provider_uncompressed_ipv6_bytes": int(round(scale_1mb * ipv6_b)),
+            "provider_otbr_6lowpan_mesh_hdr_bytes": int(round(scale_1mb * otbr_6lo_mesh_b)),
+            "provider_otbr_6lowpan_frag_hdr_bytes": int(round(scale_1mb * otbr_6lo_frag_b)),
+            "provider_otbr_6lowpan_total_hdr_bytes": int(round(scale_1mb * otbr_6lo_tot_b)),
+            "provider_otbr_mac_sec_fcs_hdr_bytes": int(round(scale_1mb * otbr_mac_hdr_b)),
+            "provider_otbr_phy_hdr_bytes": int(round(scale_1mb * otbr_phy_hdr_b)),
+            "provider_otbr_total_mac_bytes": int(round(scale_1mb * otbr_mac_b)),
+            "provider_otbr_total_phy_bytes": int(round(scale_1mb * otbr_phy_b)),
+            "downlink_2hop_6lowpan_total_hdr_bytes": int(round(scale_1mb * dl2_6lo_b)),
+            "downlink_2hop_total_mac_bytes": int(round(scale_1mb * dl2_mac_b)),
+            "downlink_2hop_total_phy_bytes": int(round(scale_1mb * dl2_phy_b)),
+        }
 
         bsize = int(manifest["block_size"])
         transport = str(manifest.get("transport", "tcp" if manifest.get("large_payload", False) else "udp")).lower()
@@ -643,6 +795,7 @@ def analyze_all_bdx_runs(sim_logs_dir: str) -> List[Dict[str, Any]]:
                 "large_payload": bool(manifest.get("large_payload", transport == "tcp")),
                 "hops": int(manifest["hops"]),
                 "thread_mode": manifest.get("thread_mode", "med"),
+                "num_requestors": num_requestors,
                 "plr": float(manifest.get("plr", 0.0)),
                 "block_size": bsize,
                 "expected_6lowpan_fragments": (
@@ -651,10 +804,11 @@ def analyze_all_bdx_runs(sim_logs_dir: str) -> List[Dict[str, Any]]:
                     else BLOCK_SIZE_TO_6LOWPAN_FRAGS.get(bsize, max(1, int(math.ceil((bsize + 84) / 88.0))))
                 ),
                 "image_size_bytes": img_bytes,
+                "total_payload_bytes": total_payload_bytes,
                 "requestor_sai_ms": int(manifest.get("requestor_sai_ms", 300)),
                 "requestor_sii_ms": int(manifest.get("requestor_sii_ms", 500)),
                 "contend_traffic": bool(manifest.get("contend_traffic", False)),
-                "completed": bool(manifest.get("transfer_metrics", {}).get("completed", False)),
+                "completed": bool(tmetrics.get("completed", False)),
                 "transfer_duration_s": round(dur_s, 3),
                 "sec_per_1kb": round(sec_per_1kb, 4),
                 "block_rtt_ms_per_1kb": round(rtt_ms_per_1kb, 2),
@@ -663,6 +817,7 @@ def analyze_all_bdx_runs(sim_logs_dir: str) -> List[Dict[str, Any]]:
                 "phy_bytes_per_1kb": round(phy_bytes_per_1kb, 1),
                 "mac_bytes_per_1kb": round(mac_bytes_per_1kb, 1),
                 "frames_per_1kb": round(frames_per_1kb, 2),
+                "provider_1mb_breakdown": provider_1mb_breakdown,
                 "verified_topology": manifest.get("verified_topology", {}),
                 "pcap": pcap_stats,
                 "logs": log_stats,
@@ -1701,6 +1856,974 @@ def plot_tcp_vs_udp_duration_and_latency(runs: List[Dict[str, Any]], out_dir: st
     return out_path
 
 
+def plot_tcp_vs_udp_individual(runs: List[Dict[str, Any]], out_dir: str) -> List[str]:
+    """Generate 4 standalone single-graph PNGs for Plot 6 (BDX over TCP 64B-8192B vs. BDX over UDP/MRP 64B-1024B):
+    1. bdx_tcp_vs_udp_duration_0fer.png
+    2. bdx_tcp_vs_udp_duration_5fer.png
+    3. bdx_tcp_vs_udp_block_rtt.png
+    4. bdx_tcp_vs_udp_amortized_rtt.png
+    """
+    configure_matplotlib_style()
+    tcp_block_sizes = [64, 128, 224, 340, 512, 1024, 2048, 4096, 8192]
+    x_pos = np.arange(len(tcp_block_sizes))
+    x_labels = [f"{b}B" for b in tcp_block_sizes]
+    hop_colors = {1: "#1a73e8", 2: "#1e8e3e", 3: "#e37400"}
+
+    tcp_runs = [r for r in runs if r.get("transport") == "tcp" and r["suite"] in ("suite_tcp", "suite_tcp_blocksizes")]
+    if not tcp_runs:
+        tcp_runs = [r for r in runs if r.get("transport") == "tcp" and r["thread_mode"] == "med" and not r["contend_traffic"]]
+    tcp_sed_runs = [r for r in runs if r.get("transport") == "tcp" and r["thread_mode"] == "sed"]
+    udp_runs = [r for r in runs if r.get("transport", "udp") == "udp" and r["suite"] == "suite2_blocksizes"]
+
+    out_paths: List[str] = []
+
+    # -------------------------------------------------------------------------
+    # Graph 1: Normalized Transfer Duration (s/KB) vs. Block Size (0% FER, 1–3 Hops)
+    # -------------------------------------------------------------------------
+    fig1, ax1 = plt.subplots(1, 1, figsize=(10.5, 6.4))
+    for hops in (1, 2, 3):
+        col = hop_colors[hops]
+        txs, tys = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in tcp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m:
+                txs.append(x_pos[idx])
+                tys.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+        if txs:
+            ax1.plot(txs, tys, "-o", color=col, linewidth=2.4, markersize=6.5, label=f"TCP {hops}-Hop (0% FER)")
+
+        uxs, uys = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in udp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m:
+                uxs.append(x_pos[idx])
+                uys.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+        if uxs:
+            ax1.plot(uxs, uys, "--^", color=col, linewidth=1.9, markersize=5.5, alpha=0.85, label=f"UDP/MRP {hops}-Hop (0% FER)")
+
+    sed0_x, sed0_y = [], []
+    for idx, b in enumerate(tcp_block_sizes):
+        m = [r for r in tcp_sed_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+        if m:
+            sed0_x.append(x_pos[idx])
+            sed0_y.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+    if sed0_x:
+        ax1.plot(sed0_x, sed0_y, "-D", color="#9334e6", linewidth=2.2, markersize=6, label="TCP 3-Hop SED (0% FER)")
+
+    ax1.axvline(x_pos[5], color="#5f6368", linestyle=":", linewidth=1.5, label="Spec Max Non-TCP Block Size (1024 B)")
+    ax1.axvspan(x_pos[6] - 0.3, x_pos[8] + 0.3, color="#1a73e8", alpha=0.08, label="TCP LargeBlock Region (2048 B – 8192 B)")
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(x_labels)
+    ax1.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax1.set_ylabel("Total Transfer Duration per 1 KB (s / KB)")
+    ax1.set_title(
+        "Matter BDX Over Thread: Total Transfer Duration per 1 KB vs. Block Size (0% FER, 1–3 Hops)\n"
+        "(BDX Over TCP [64 B – 8192 B] vs. BDX Over UDP/MRP [64 B – 1024 B])"
+    )
+    ax1.legend(loc="upper right", fontsize=8.4, ncol=2)
+    fig1.tight_layout()
+    p_d0 = os.path.join(out_dir, "bdx_tcp_vs_udp_duration_0fer.png")
+    fig1.savefig(p_d0, dpi=180, bbox_inches="tight")
+    plt.close(fig1)
+    out_paths.append(p_d0)
+
+    # -------------------------------------------------------------------------
+    # Graph 2: Normalized Transfer Duration (s/KB) vs. Block Size (5% FER, 1–3 Hops)
+    # -------------------------------------------------------------------------
+    fig2, ax2 = plt.subplots(1, 1, figsize=(10.5, 6.4))
+    for hops in (1, 2, 3):
+        col = hop_colors[hops]
+        txs5, tys5 = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in tcp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+            if m:
+                txs5.append(x_pos[idx])
+                tys5.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+        if txs5:
+            ax2.plot(txs5, tys5, "-o", color=col, linewidth=2.4, markersize=6.5, label=f"TCP {hops}-Hop (5% FER)")
+
+        uxs5, uys5 = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in udp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+            if m:
+                uxs5.append(x_pos[idx])
+                uys5.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+        if uxs5:
+            ax2.plot(uxs5, uys5, "--^", color=col, linewidth=1.9, markersize=5.5, alpha=0.85, label=f"UDP/MRP {hops}-Hop (5% FER)")
+
+    sed5_x, sed5_y = [], []
+    for idx, b in enumerate(tcp_block_sizes):
+        m = [r for r in tcp_sed_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+        if m:
+            sed5_x.append(x_pos[idx])
+            sed5_y.append(float(np.mean([r["sec_per_1kb"] for r in m])))
+    if sed5_x:
+        ax2.plot(sed5_x, sed5_y, "-D", color="#9334e6", linewidth=2.2, markersize=6, label="TCP 3-Hop SED (5% FER)")
+
+    ax2.axvline(x_pos[5], color="#5f6368", linestyle=":", linewidth=1.5, label="Spec Max Non-TCP Block Size (1024 B)")
+    ax2.axvspan(x_pos[6] - 0.3, x_pos[8] + 0.3, color="#1a73e8", alpha=0.08, label="TCP LargeBlock Region (2048 B – 8192 B)")
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(x_labels)
+    ax2.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax2.set_ylabel("Total Transfer Duration per 1 KB (s / KB)")
+    ax2.set_title(
+        "Matter BDX Over Thread: Total Transfer Duration per 1 KB Under 5% FER vs. Block Size (1–3 Hops)\n"
+        "(BDX Over TCP [64 B – 8192 B] vs. BDX Over UDP/MRP [64 B – 1024 B])"
+    )
+    ax2.legend(loc="upper right", fontsize=8.4, ncol=2)
+    fig2.tight_layout()
+    p_d5 = os.path.join(out_dir, "bdx_tcp_vs_udp_duration_5fer.png")
+    fig2.savefig(p_d5, dpi=180, bbox_inches="tight")
+    plt.close(fig2)
+    out_paths.append(p_d5)
+
+    # -------------------------------------------------------------------------
+    # Graph 3: Per-Block Round-Trip Latency (ms) vs. Block Size (64 B – 8192 B)
+    # -------------------------------------------------------------------------
+    fig3, ax3 = plt.subplots(1, 1, figsize=(10.5, 6.4))
+    for hops in (1, 2, 3):
+        col = hop_colors[hops]
+        txs_r, tys_r = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in tcp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m and m[0]["logs"]["block_rtt_ms"]["mean"] > 0:
+                txs_r.append(x_pos[idx])
+                tys_r.append(float(np.mean([r["logs"]["block_rtt_ms"]["mean"] for r in m])))
+        if txs_r:
+            ax3.plot(txs_r, tys_r, "-o", color=col, linewidth=2.4, markersize=6.5, label=f"TCP {hops}-Hop Block RTT (0% FER)")
+
+        uxs_r, uys_r = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in udp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m and m[0]["logs"]["block_rtt_ms"]["mean"] > 0:
+                uxs_r.append(x_pos[idx])
+                uys_r.append(float(np.mean([r["logs"]["block_rtt_ms"]["mean"] for r in m])))
+        if uxs_r:
+            ax3.plot(uxs_r, uys_r, "--^", color=col, linewidth=1.9, markersize=5.5, alpha=0.85, label=f"UDP/MRP {hops}-Hop Block RTT (0% FER)")
+
+    t3_5_x, t3_5_y = [], []
+    for idx, b in enumerate(tcp_block_sizes):
+        m = [r for r in tcp_runs if r["hops"] == 3 and r["block_size"] == b and abs(r["plr"] - 0.05) < 1e-6]
+        if m and m[0]["logs"]["block_rtt_ms"]["mean"] > 0:
+            t3_5_x.append(x_pos[idx])
+            t3_5_y.append(float(np.mean([r["logs"]["block_rtt_ms"]["mean"] for r in m])))
+    if t3_5_x:
+        ax3.plot(t3_5_x, t3_5_y, "-s", color="#d93025", linewidth=2.1, markersize=5.5, label="TCP 3-Hop Block RTT (5% FER)")
+
+    ax3.axvline(x_pos[5], color="#5f6368", linestyle=":", linewidth=1.5, label="Spec Max Non-TCP Block Size (1024 B)")
+    ax3.axvspan(x_pos[6] - 0.3, x_pos[8] + 0.3, color="#1a73e8", alpha=0.08, label="TCP LargeBlock Region (2048 B – 8192 B)")
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(x_labels)
+    ax3.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax3.set_ylabel("Mean Per-Block BDX Round-Trip Latency (ms)")
+    ax3.set_title(
+        "Matter BDX Over Thread: Mean Per-Block BDX Round-Trip Latency (ms) vs. Block Size\n"
+        "(BDX Over TCP [64 B – 8192 B] vs. BDX Over UDP/MRP [64 B – 1024 B])"
+    )
+    ax3.legend(loc="upper left", fontsize=8.4, ncol=2)
+    fig3.tight_layout()
+    p_rtt = os.path.join(out_dir, "bdx_tcp_vs_udp_block_rtt.png")
+    fig3.savefig(p_rtt, dpi=180, bbox_inches="tight")
+    plt.close(fig3)
+    out_paths.append(p_rtt)
+
+    # -------------------------------------------------------------------------
+    # Graph 4: Amortized Block Exchange Latency per 1 KB (ms / KB) vs. Block Size
+    # -------------------------------------------------------------------------
+    fig4, ax4 = plt.subplots(1, 1, figsize=(10.5, 6.4))
+    for hops in (1, 2, 3):
+        col = hop_colors[hops]
+        txs_k, tys_k = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in tcp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m and m[0]["block_rtt_ms_per_1kb"] > 0:
+                txs_k.append(x_pos[idx])
+                tys_k.append(float(np.mean([r["block_rtt_ms_per_1kb"] for r in m])))
+        if txs_k:
+            ax4.plot(txs_k, tys_k, "-o", color=col, linewidth=2.4, markersize=6.5, label=f"TCP {hops}-Hop Amortized RTT (0% FER)")
+
+        uxs_k, uys_k = [], []
+        for idx, b in enumerate(tcp_block_sizes):
+            m = [r for r in udp_runs if r["hops"] == hops and r["block_size"] == b and abs(r["plr"] - 0.0) < 1e-6]
+            if m and m[0]["block_rtt_ms_per_1kb"] > 0:
+                uxs_k.append(x_pos[idx])
+                uys_k.append(float(np.mean([r["block_rtt_ms_per_1kb"] for r in m])))
+        if uxs_k:
+            ax4.plot(uxs_k, uys_k, "--^", color=col, linewidth=1.9, markersize=5.5, alpha=0.85, label=f"UDP/MRP {hops}-Hop Amortized RTT (0% FER)")
+
+    ax4.axvline(x_pos[5], color="#5f6368", linestyle=":", linewidth=1.5, label="Spec Max Non-TCP Block Size (1024 B)")
+    ax4.axvspan(x_pos[6] - 0.3, x_pos[8] + 0.3, color="#1a73e8", alpha=0.08, label="TCP LargeBlock Region (2048 B – 8192 B)")
+    ax4.set_xticks(x_pos)
+    ax4.set_xticklabels(x_labels)
+    ax4.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax4.set_ylabel("Amortized Per-Block Latency per 1 KB (ms / KB)")
+    ax4.set_title(
+        "Matter BDX Over Thread: Amortized Block Exchange Latency per 1 KB (ms / KB) vs. Block Size\n"
+        "(BDX Over TCP [64 B – 8192 B] vs. BDX Over UDP/MRP [64 B – 1024 B])"
+    )
+    ax4.legend(loc="upper right", fontsize=8.4, ncol=2)
+    fig4.tight_layout()
+    p_artt = os.path.join(out_dir, "bdx_tcp_vs_udp_amortized_rtt.png")
+    fig4.savefig(p_artt, dpi=180, bbox_inches="tight")
+    plt.close(fig4)
+    out_paths.append(p_artt)
+
+    return out_paths
+
+
+def plot_dual_med_wifi_evaluation(runs: List[Dict[str, Any]], out_dir: str) -> str:
+    """Plot 7: Dual-MED Concurrent 2x1MB OTA Update (2 Hops via Shared Router A1, 5% FER + 10% Wi-Fi Interferer) — UDP/MRP vs. TCP & Total Provider Bytes Sent."""
+    configure_matplotlib_style()
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18.5, 11.8))
+    fig.suptitle(
+        "Dual-MED Concurrent 2×1 MB OTA Update (2 Hops via Shared Router A1, 5% FER + 10% Wi-Fi Airtime Interferer)\n"
+        "(BDX-over-UDP/MRP [64B–1024B] vs. BDX-over-TCP [64B–8192B]: Transfer Duration, Block Latency & Total Bytes Sent from OTA Provider)",
+        y=0.985,
+    )
+
+    all_blocks = [64, 128, 224, 340, 416, 512, 608, 704, 800, 896, 1024, 2048, 4096, 8192]
+    x_pos = np.arange(len(all_blocks))
+    x_labels = [f"{b}B" for b in all_blocks]
+
+    dm_runs = [
+        r
+        for r in runs
+        if (r["suite"] == "suite_dual_med_wifi" or r["topology_id"] == "bdx_dual_med_wifi")
+        and r.get("num_requestors", 2) == 2
+        and r["suite"] != "suite_congestion_scale"
+    ]
+    udp_dm = {r["block_size"]: r for r in dm_runs if r["transport"] == "udp"}
+    tcp_dm = {r["block_size"]: r for r in dm_runs if r["transport"] == "tcp"}
+
+    # -------------------------------------------------------------------------
+    # Panel A (Top-Left): Total Transfer Duration for 2 x 1 MB Concurrent OTA (Minutes) vs. Block Size
+    # -------------------------------------------------------------------------
+    ux, uy_dur = [], []
+    tx, ty_dur = [], []
+    for idx, b in enumerate(all_blocks):
+        if b in udp_dm:
+            ux.append(x_pos[idx])
+            uy_dur.append(float(udp_dm[b]["provider_1mb_breakdown"]["projected_duration_min"]))
+        if b in tcp_dm:
+            tx.append(x_pos[idx])
+            ty_dur.append(float(tcp_dm[b]["provider_1mb_breakdown"]["projected_duration_min"]))
+
+    if ux:
+        ax1.plot(ux, uy_dur, "--^", color="#d93025", linewidth=2.2, markersize=6.5, label="BDX-over-UDP/MRP (2×1 MB Duration, min)")
+    if tx:
+        ax1.plot(tx, ty_dur, "-o", color="#1a73e8", linewidth=2.4, markersize=6.5, label="BDX-over-TCP (2×1 MB Duration, min)")
+
+    for x_v, y_v, b_v in zip(ux, uy_dur, [all_blocks[i] for i in range(len(all_blocks)) if all_blocks[i] in udp_dm]):
+        if b_v in (64, 340, 800, 896, 1024):
+            ax1.annotate(
+                f"{y_v:.1f}m",
+                (x_v, y_v),
+                textcoords="offset points",
+                xytext=(0, 8),
+                ha="center",
+                fontsize=7.8,
+                fontweight="bold",
+                color="#b31412",
+            )
+    for x_v, y_v, b_v in zip(tx, ty_dur, [all_blocks[i] for i in range(len(all_blocks)) if all_blocks[i] in tcp_dm]):
+        if b_v in (64, 340, 1024, 4096, 8192):
+            ax1.annotate(
+                f"{y_v:.1f}m",
+                (x_v, y_v),
+                textcoords="offset points",
+                xytext=(0, -13 if b_v <= 340 else 8),
+                ha="center",
+                fontsize=7.8,
+                fontweight="bold",
+                color="#174ea6",
+            )
+
+    ax1.axvline(x_pos[10], color="#5f6368", linestyle=":", linewidth=1.5, label="Spec Max Non-TCP Block Size (1024 B)")
+    ax1.axvspan(x_pos[3] - 0.35, x_pos[8] + 0.35, color="#1e8e3e", alpha=0.08, label="UDP Sweet Spot (340B–800B: 8.3–11.5 min)")
+    ax1.axvspan(x_pos[11] - 0.35, x_pos[13] + 0.35, color="#1a73e8", alpha=0.08, label="TCP LargeBlock Region (2048B–8192B: 10.0–10.9 min)")
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(x_labels, rotation=30)
+    ax1.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax1.set_ylabel("Concurrent 2×1 MB Transfer Duration (Minutes)")
+    ax1.set_title("A. Concurrent 2×1 MB OTA Transfer Duration vs. Block Size (5% FER + 10% Wi-Fi)")
+    ax1.legend(loc="upper right", fontsize=7.6)
+
+    # -------------------------------------------------------------------------
+    # Panel B (Top-Right): Per-Block BDX Round-Trip Latency (ms) & Amortized Latency per 1 KB (ms/KB)
+    # -------------------------------------------------------------------------
+    ux_r, uy_rtt, uy_amort = [], [], []
+    tx_r, ty_rtt, ty_amort = [], [], []
+    for idx, b in enumerate(all_blocks):
+        if b in udp_dm:
+            ux_r.append(x_pos[idx])
+            uy_rtt.append(float(udp_dm[b]["logs"]["block_rtt_ms"]["mean"]))
+            uy_amort.append(float(udp_dm[b]["block_rtt_ms_per_1kb"]))
+        if b in tcp_dm:
+            tx_r.append(x_pos[idx])
+            ty_rtt.append(float(tcp_dm[b]["logs"]["block_rtt_ms"]["mean"]))
+            ty_amort.append(float(tcp_dm[b]["block_rtt_ms_per_1kb"]))
+
+    if ux_r:
+        ax2.plot(ux_r, uy_rtt, "--^", color="#d93025", linewidth=2.2, markersize=6, label="UDP/MRP Mean Per-Block RTT (ms)")
+        ax2.plot(ux_r, uy_amort, ":v", color="#e37400", linewidth=1.9, markersize=5, label="UDP/MRP Amortized Block Latency (ms / KB)")
+    if tx_r:
+        ax2.plot(tx_r, ty_rtt, "-o", color="#1a73e8", linewidth=2.2, markersize=6, label="TCP Mean Per-Block RTT (ms)")
+        ax2.plot(tx_r, ty_amort, "-.s", color="#1e8e3e", linewidth=2.0, markersize=5, label="TCP Amortized Block Latency (ms / KB)")
+
+    ax2.axvline(x_pos[10], color="#5f6368", linestyle=":", linewidth=1.5)
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(x_labels, rotation=30)
+    ax2.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax2.set_ylabel("Latency (ms per Block  |  ms per 1 KB)")
+    ax2.set_title("B. Per-Block Round-Trip Latency (ms) & Amortized Latency (ms/KB) vs. Block Size")
+    ax2.legend(loc="upper left", fontsize=7.6)
+
+    # -------------------------------------------------------------------------
+    # Panel C (Bottom-Left): Total Bytes Sent from OTA Provider / OTBR to Transmit 2 x 1 MB (2.10 MB Raw)
+    # -------------------------------------------------------------------------
+    u_matter_mb, u_ipv6_mb, u_mac_mb, u_phy_mb = [], [], [], []
+    t_matter_mb, t_ipv6_mb, t_mac_mb, t_phy_mb = [], [], [], []
+    for idx, b in enumerate(all_blocks):
+        if b in udp_dm:
+            brk = udp_dm[b]["provider_1mb_breakdown"]
+            u_matter_mb.append(brk["provider_matter_total_bytes"] / 1e6)
+            u_ipv6_mb.append(brk["provider_uncompressed_ipv6_bytes"] / 1e6)
+            u_mac_mb.append(brk["provider_otbr_total_mac_bytes"] / 1e6)
+            u_phy_mb.append(brk["provider_otbr_total_phy_bytes"] / 1e6)
+        if b in tcp_dm:
+            brk = tcp_dm[b]["provider_1mb_breakdown"]
+            t_matter_mb.append(brk["provider_matter_total_bytes"] / 1e6)
+            t_ipv6_mb.append(brk["provider_uncompressed_ipv6_bytes"] / 1e6)
+            t_mac_mb.append(brk["provider_otbr_total_mac_bytes"] / 1e6)
+            t_phy_mb.append(brk["provider_otbr_total_phy_bytes"] / 1e6)
+
+    ax3.axhline(2.097152, color="#202124", linestyle="-", linewidth=1.6, label="Raw OTA Firmware Payload (2×1 MiB = 2.10 MB)")
+    if ux:
+        ax3.plot(ux, u_ipv6_mb, "--d", color="#e37400", linewidth=1.9, markersize=5.5, label="UDP/MRP Provider Uncompressed IPv6 Sent (MB)")
+        ax3.plot(ux, u_mac_mb, "--^", color="#d93025", linewidth=2.3, markersize=6.5, label="UDP/MRP Provider/OTBR 6LoWPAN+802.15.4 MAC Sent (MB)")
+    if tx:
+        ax3.plot(tx, t_ipv6_mb, "-s", color="#1e8e3e", linewidth=1.9, markersize=5.5, label="TCP Provider Uncompressed IPv6 Sent (MB)")
+        ax3.plot(tx, t_mac_mb, "-o", color="#1a73e8", linewidth=2.4, markersize=6.5, label="TCP Provider/OTBR 6LoWPAN+802.15.4 MAC Sent (MB)")
+
+    ax3.axvline(x_pos[10], color="#5f6368", linestyle=":", linewidth=1.5)
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(x_labels, rotation=30)
+    ax3.set_xlabel("BDX MaxBlockSize (Bytes)")
+    ax3.set_ylabel("Total Bytes Sent by OTA Provider / OTBR (MB)")
+    ax3.set_title("C. Total Bytes Sent by OTA Provider / OTBR for 2×1 MB Payload (IPv6 vs. 6LoWPAN/MAC)")
+    ax3.legend(loc="upper right", fontsize=7.4)
+
+    # -------------------------------------------------------------------------
+    # Panel D (Bottom-Right): Stacked Byte-Layer Decomposition at OTA Provider / OTBR (Hop 1 PHY Bytes)
+    # Compare key UDP (64..1024B) and TCP (340..8192B) configurations side-by-side
+    # -------------------------------------------------------------------------
+    comp_configs = [
+        ("UDP\n64B", "udp", 64),
+        ("UDP\n128B", "udp", 128),
+        ("UDP\n224B", "udp", 224),
+        ("UDP\n340B", "udp", 340),
+        ("UDP\n512B", "udp", 512),
+        ("UDP\n800B", "udp", 800),
+        ("UDP\n896B", "udp", 896),
+        ("UDP\n1024B", "udp", 1024),
+        ("TCP\n64B", "tcp", 64),
+        ("TCP\n340B", "tcp", 340),
+        ("TCP\n512B", "tcp", 512),
+        ("TCP\n1024B", "tcp", 1024),
+        ("TCP\n2048B", "tcp", 2048),
+        ("TCP\n4096B", "tcp", 4096),
+        ("TCP\n8192B", "tcp", 8192),
+    ]
+    c_labels = []
+    raw_mb_arr = []
+    upper_hdr_retx_mb_arr = []
+    sixlo_hdr_mb_arr = []
+    mac_phy_hdr_mb_arr = []
+
+    for lbl, tr_k, bs_k in comp_configs:
+        src_map = udp_dm if tr_k == "udp" else tcp_dm
+        if bs_k not in src_map:
+            continue
+        brk = src_map[bs_k]["provider_1mb_breakdown"]
+        c_labels.append(lbl)
+        raw_mb = brk["raw_payload_bytes"] / 1e6
+        sixlo_mb = brk["provider_otbr_6lowpan_total_hdr_bytes"] / 1e6
+        mac_phy_mb = (brk["provider_otbr_mac_sec_fcs_hdr_bytes"] + brk["provider_otbr_phy_hdr_bytes"]) / 1e6
+        tot_phy_mb = brk["provider_otbr_total_phy_bytes"] / 1e6
+        upper_mb = max(0.0, tot_phy_mb - raw_mb - sixlo_mb - mac_phy_mb)
+        raw_mb_arr.append(raw_mb)
+        upper_hdr_retx_mb_arr.append(upper_mb)
+        sixlo_hdr_mb_arr.append(sixlo_mb)
+        mac_phy_hdr_mb_arr.append(mac_phy_mb)
+
+    x_d = np.arange(len(c_labels))
+    raw_np = np.array(raw_mb_arr)
+    up_np = np.array(upper_hdr_retx_mb_arr)
+    s6_np = np.array(sixlo_hdr_mb_arr)
+    mp_np = np.array(mac_phy_hdr_mb_arr)
+
+    ax4.bar(x_d, raw_np, width=0.62, color="#1e8e3e", label="Raw OTA Payload (2.10 MB)")
+    ax4.bar(
+        x_d,
+        up_np,
+        width=0.62,
+        bottom=raw_np,
+        color="#f9ab00",
+        label="BDX/Matter/UDP/TCP/IPHC Headers + Retransmissions (MRP/TCP/MAC)",
+    )
+    ax4.bar(
+        x_d,
+        s6_np,
+        width=0.62,
+        bottom=raw_np + up_np,
+        color="#d93025",
+        label="6LoWPAN Fragmentation (FRAG1/FRAGN) + Mesh Routing Headers",
+    )
+    ax4.bar(
+        x_d,
+        mp_np,
+        width=0.62,
+        bottom=raw_np + up_np + s6_np,
+        color="#1a73e8",
+        label="802.15.4 MAC + AuxSec + MIC-32 + FCS (21B/frm) + PHY (6B/frm)",
+    )
+    tot_np = raw_np + up_np + s6_np + mp_np
+    for idx_d, tot_v in enumerate(tot_np):
+        ax4.text(x_d[idx_d], tot_v + 0.22, f"{tot_v:.1f}M", ha="center", va="bottom", fontsize=7.1, fontweight="bold")
+
+    ax4.set_xticks(x_d)
+    ax4.set_xticklabels(c_labels, fontsize=7.6)
+    ax4.set_ylim(0, max(list(tot_np) + [18.0]) * 1.15)
+    ax4.set_ylabel("Total OTBR PHY Bytes Sent for 2×1 MB (MB)")
+    ax4.set_title("D. Stacked Provider / OTBR Byte-Layer Overhead Decomposition (2×1 MB Transfer)")
+    ax4.legend(loc="upper right", fontsize=7.2)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    out_path = os.path.join(out_dir, "bdx_dual_med_wifi_evaluation.png")
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_concurrent_sessions_scaling(runs: List[Dict[str, Any]], out_dir: str) -> str:
+    """Plot 8: Concurrent OTA Session Scaling (N = 2..6 MED Requestors, 2 Hops via Shared Router A1, 5% FER + 10% Wi-Fi) — UDP 340B vs. TCP 4096B."""
+    configure_matplotlib_style()
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18.0, 11.6))
+    fig.suptitle(
+        "Matter BDX Over Thread Under Escalating Multi-Session Congestion (N = 2..6 Concurrent MED Sessions, 2 Hops via Shared Router A1)\n"
+        "(5% FER + 10% Wi-Fi Airtime Interferer — BDX-over-UDP/MRP [340 B, 4 Frags] vs. BDX-over-TCP [4096 B, 5 Frags/Segment])",
+        y=0.985,
+    )
+
+    n_values = [2, 3, 4, 5, 6]
+    # Collect runs for N = 2..6 (prefer suite_congestion_scale, fall back to suite_dual_med_wifi for N=2)
+    udp_by_n: Dict[int, Dict[str, Any]] = {}
+    tcp_by_n: Dict[int, Dict[str, Any]] = {}
+    for r in runs:
+        if not r.get("completed", True):
+            continue
+        n_req = int(r.get("num_requestors", 1))
+        if n_req not in n_values:
+            continue
+        if r["suite"] not in ("suite_congestion_scale", "suite_dual_med_wifi"):
+            continue
+        if r["transport"] == "udp" and r["block_size"] == 340:
+            if n_req not in udp_by_n or r["suite"] == "suite_congestion_scale":
+                udp_by_n[n_req] = r
+        elif r["transport"] == "tcp" and r["block_size"] == 4096:
+            if n_req not in tcp_by_n or r["suite"] == "suite_congestion_scale":
+                tcp_by_n[n_req] = r
+
+    ux = sorted(udp_by_n.keys())
+    tx = sorted(tcp_by_n.keys())
+
+    # -------------------------------------------------------------------------
+    # Panel A (Top-Left): Total Duration of Entire Concurrent OTA Process (N x 1 MB in Minutes & N x 16 KB in Seconds)
+    # -------------------------------------------------------------------------
+    u_tot_min = [float(udp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"]) for n in ux]
+    u_min_min = [float(udp_by_n[n]["provider_1mb_breakdown"].get("min_node_duration_min", udp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"])) for n in ux]
+    u_mean_min = [float(udp_by_n[n]["provider_1mb_breakdown"].get("mean_node_duration_min", udp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"])) for n in ux]
+    u_raw_sec = [float(udp_by_n[n]["transfer_duration_s"]) for n in ux]
+
+    t_tot_min = [float(tcp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"]) for n in tx]
+    t_min_min = [float(tcp_by_n[n]["provider_1mb_breakdown"].get("min_node_duration_min", tcp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"])) for n in tx]
+    t_mean_min = [float(tcp_by_n[n]["provider_1mb_breakdown"].get("mean_node_duration_min", tcp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"])) for n in tx]
+    t_raw_sec = [float(tcp_by_n[n]["transfer_duration_s"]) for n in tx]
+
+    if ux:
+        ax1.fill_between(ux, u_min_min, u_tot_min, color="#d93025", alpha=0.12, label="UDP 340B First-to-Last Node Completion Spread")
+        ax1.plot(ux, u_tot_min, "--^", color="#d93025", linewidth=2.6, markersize=7.5, label="BDX-over-UDP/MRP (340 B) — Entire Process Duration (min)")
+        ax1.plot(ux, u_mean_min, ":v", color="#e37400", linewidth=1.8, markersize=5.5, label="BDX-over-UDP/MRP (340 B) — Mean Single-Node Duration (min)")
+    if tx:
+        ax1.fill_between(tx, t_min_min, t_tot_min, color="#1a73e8", alpha=0.12, label="TCP 4096B First-to-Last Node Completion Spread")
+        ax1.plot(tx, t_tot_min, "-o", color="#1a73e8", linewidth=2.6, markersize=7.5, label="BDX-over-TCP (4096 B) — Entire Process Duration (min)")
+        ax1.plot(tx, t_mean_min, "-.s", color="#1e8e3e", linewidth=1.8, markersize=5.5, label="BDX-over-TCP (4096 B) — Mean Single-Node Duration (min)")
+
+    # Reference linear scaling from N=2 baseline
+    if 2 in tcp_by_n:
+        base_2 = float(tcp_by_n[2]["provider_1mb_breakdown"]["projected_duration_min"])
+        lin_y = [base_2 * (n / 2.0) for n in n_values]
+        ax1.plot(n_values, lin_y, ":", color="#5f6368", linewidth=1.5, label="Ideal Linear Channel-Sharing Scaling from N=2 ((N/2) × T₂)")
+
+    for n_v, y_v, s_v in zip(ux, u_tot_min, u_raw_sec):
+        u_xytext = (-16, 10) if n_v in (2, 3) else (0, 9)
+        ax1.annotate(
+            f"{y_v:.1f}m\n({s_v:.1f}s)",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=u_xytext,
+            ha="center",
+            fontsize=7.8,
+            fontweight="bold",
+            color="#b31412",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.75),
+        )
+    for n_v, y_v, s_v in zip(tx, t_tot_min, t_raw_sec):
+        t_xytext = (18, -18) if n_v in (2, 3, 4) else (0, 9)
+        ax1.annotate(
+            f"{y_v:.1f}m\n({s_v:.1f}s)",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=t_xytext,
+            ha="center",
+            fontsize=7.8,
+            fontweight="bold",
+            color="#174ea6",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.75),
+        )
+
+    ax1.set_xticks(n_values)
+    ax1.set_xticklabels([f"N={n}\n({n}×1 MB)" for n in n_values])
+    ax1.set_xlabel("Number of Concurrent MED OTA Sessions Sharing Intermediate Router A1 (N)")
+    ax1.set_ylabel("Total Process Duration for N×1 MB OTA (Minutes)")
+    ax1.set_title("A. Total Duration of Entire OTA Process vs. Concurrent Sessions (N = 2..6)")
+    all_y1 = u_tot_min + t_tot_min + [15.0]
+    ax1.set_ylim(-4, max(all_y1) * 1.25)
+    ax1.legend(loc="upper left", fontsize=7.6)
+
+    # -------------------------------------------------------------------------
+    # Panel B (Top-Right): Normalized Transfer Cost per 1 KB (s/KB) & Aggregate Mesh Goodput (KB/s)
+    # -------------------------------------------------------------------------
+    u_sec_kb = [float(udp_by_n[n]["sec_per_1kb"]) for n in ux]
+    t_sec_kb = [float(tcp_by_n[n]["sec_per_1kb"]) for n in tx]
+    u_kbps = [1.0 / max(1e-6, float(udp_by_n[n]["sec_per_1kb"])) for n in ux]
+    t_kbps = [1.0 / max(1e-6, float(tcp_by_n[n]["sec_per_1kb"])) for n in tx]
+
+    ax2_r = ax2.twinx()
+    ax2_r.grid(False)
+
+    l1 = ax2.plot(ux, u_sec_kb, "--^", color="#d93025", linewidth=2.3, markersize=7, label="UDP 340B Normalized Time per KB (s/KB, left)") if ux else []
+    l2 = ax2.plot(tx, t_sec_kb, "-o", color="#1a73e8", linewidth=2.3, markersize=7, label="TCP 4096B Normalized Time per KB (s/KB, left)") if tx else []
+    l3 = ax2_r.plot(ux, u_kbps, ":v", color="#e37400", linewidth=2.0, markersize=6, label="UDP 340B Aggregate Mesh Goodput (KB/s, right)") if ux else []
+    l4 = ax2_r.plot(tx, t_kbps, "-.s", color="#1e8e3e", linewidth=2.0, markersize=6, label="TCP 4096B Aggregate Mesh Goodput (KB/s, right)") if tx else []
+
+    for n_v, y_v in zip(ux, u_sec_kb):
+        ax2.annotate(f"{y_v:.2f} s/KB", (n_v, y_v), textcoords="offset points", xytext=(0, 8), ha="center", fontsize=7.8, fontweight="bold", color="#b31412")
+    for n_v, y_v in zip(tx, t_sec_kb):
+        ax2.annotate(f"{y_v:.2f} s/KB", (n_v, y_v), textcoords="offset points", xytext=(0, -14), ha="center", fontsize=7.8, fontweight="bold", color="#174ea6")
+
+    ax2.set_xticks(n_values)
+    ax2.set_xticklabels([f"N={n}" for n in n_values])
+    ax2.set_xlabel("Number of Concurrent MED OTA Sessions (N)")
+    ax2.set_ylabel("Normalized Transfer Time per 1 KB of Aggregate OTA (s / KB)", color="#202124")
+    ax2_r.set_ylabel("Aggregate OTA Payload Goodput Across All N Sessions (KB / s)", color="#1e8e3e")
+    ax2.set_ylim(0, max(u_sec_kb + t_sec_kb + [0.6]) * 1.30)
+    ax2_r.set_ylim(0, max(u_kbps + t_kbps + [4.0]) * 1.30)
+    ax2.set_title("B. Normalized Transfer Rate (s/KB) & Aggregate Mesh Goodput (KB/s) vs. N")
+    lines_2 = l1 + l2 + l3 + l4
+    labels_2 = [l.get_label() for l in lines_2]
+    ax2.legend(lines_2, labels_2, loc="upper right", fontsize=7.5)
+
+    # -------------------------------------------------------------------------
+    # Panel C (Bottom-Left): Amortized Per-Block Latency (ms/KB), Provider MRP Retries & Router A1 Contention
+    # -------------------------------------------------------------------------
+    u_amort_ms = [float(udp_by_n[n]["block_rtt_ms_per_1kb"]) for n in ux]
+    t_amort_ms = [float(tcp_by_n[n]["block_rtt_ms_per_1kb"]) for n in tx]
+    u_mrp_retx = [int(udp_by_n[n]["logs"]["total_mrp_retries"]) for n in ux]
+    u_a1_noack = [int(udp_by_n[n]["logs"]["node_mac_stats"].get("otns_2_router_1", {}).get("mac_tx_no_ack", 0)) for n in ux]
+    t_a1_noack = [int(tcp_by_n[n]["logs"]["node_mac_stats"].get("otns_2_router_1", {}).get("mac_tx_no_ack", 0)) for n in tx]
+
+    ax3_r = ax3.twinx()
+    ax3_r.grid(False)
+
+    c1 = ax3.plot(ux, u_amort_ms, "--^", color="#d93025", linewidth=2.3, markersize=7, label="UDP 340B Per-Node Amortized Block RTT (ms/KB, left)") if ux else []
+    c2 = ax3.plot(tx, t_amort_ms, "-o", color="#1a73e8", linewidth=2.3, markersize=7, label="TCP 4096B Per-Node Amortized Block RTT (ms/KB, left)") if tx else []
+    c3 = ax3_r.bar(np.array(ux) - 0.16, u_mrp_retx, width=0.28, color="#f9ab00", alpha=0.80, label="UDP 340B Provider MRP Retries (right)") if ux else []
+    c4 = ax3_r.plot(ux, u_a1_noack, ":d", color="#b31412", linewidth=1.8, markersize=5.5, label="UDP 340B Router A1 MAC NoAck Retries (right)") if ux else []
+    c5 = ax3_r.plot(tx, t_a1_noack, "-.s", color="#1e8e3e", linewidth=1.8, markersize=5.5, label="TCP 4096B Router A1 MAC NoAck Retries (right)") if tx else []
+
+    ax3.set_xticks(n_values)
+    ax3.set_xticklabels([f"N={n}" for n in n_values])
+    ax3.set_xlabel("Number of Concurrent MED OTA Sessions (N)")
+    ax3.set_ylabel("Per-Node Amortized Block RTT Latency (ms / KB)", color="#202124")
+    ax3_r.set_ylabel("MRP Retransmissions  |  Router A1 MAC NoAck Count", color="#b31412")
+    ax3.set_title("C. Per-Node Amortized Block Latency (ms/KB), MRP Retries & Router A1 MAC Contention")
+    ax3.legend(loc="upper left", fontsize=7.4)
+    ax3_r.legend(loc="upper right", fontsize=7.4)
+
+    # -------------------------------------------------------------------------
+    # Panel D (Bottom-Right): Total Bytes Sent from OTA Provider / OTBR (MB) for N x 1 MB Payload
+    # -------------------------------------------------------------------------
+    raw_n_mb = [ (n * 1048576) / 1e6 for n in n_values ]
+    u_ipv6_n = [ float(udp_by_n[n]["provider_1mb_breakdown"]["provider_uncompressed_ipv6_bytes"]) / 1e6 for n in ux ]
+    u_mac_n = [ float(udp_by_n[n]["provider_1mb_breakdown"]["provider_otbr_total_mac_bytes"]) / 1e6 for n in ux ]
+    t_ipv6_n = [ float(tcp_by_n[n]["provider_1mb_breakdown"]["provider_uncompressed_ipv6_bytes"]) / 1e6 for n in tx ]
+    t_mac_n = [ float(tcp_by_n[n]["provider_1mb_breakdown"]["provider_otbr_total_mac_bytes"]) / 1e6 for n in tx ]
+
+    ax4.plot(n_values, raw_n_mb, "-k", linewidth=1.8, label="Raw Aggregate OTA Firmware Payload (N × 1.05 MB)")
+    if ux:
+        ax4.plot(ux, u_ipv6_n, "--d", color="#e37400", linewidth=2.0, markersize=6, label="UDP 340B Provider Uncompressed IPv6 Sent (MB)")
+        ax4.plot(ux, u_mac_n, "--^", color="#d93025", linewidth=2.4, markersize=7, label="UDP 340B Provider/OTBR 6LoWPAN+802.15.4 MAC Sent (MB)")
+    if tx:
+        ax4.plot(tx, t_ipv6_n, "-s", color="#1e8e3e", linewidth=2.0, markersize=6, label="TCP 4096B Provider Uncompressed IPv6 Sent (MB)")
+        ax4.plot(tx, t_mac_n, "-o", color="#1a73e8", linewidth=2.4, markersize=7, label="TCP 4096B Provider/OTBR 6LoWPAN+802.15.4 MAC Sent (MB)")
+
+    for n_v, y_v in zip(ux, u_mac_n):
+        ax4.annotate(
+            f"{y_v:.2f}M",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=(0, 8),
+            ha="center",
+            fontsize=7.6,
+            fontweight="bold",
+            color="#b31412",
+            bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.75),
+        )
+    for n_v, y_v in zip(tx, t_mac_n):
+        d_xy = (16, -12) if n_v in (2, 3) else (0, -14)
+        ax4.annotate(
+            f"{y_v:.2f}M",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=d_xy,
+            ha="center",
+            fontsize=7.6,
+            fontweight="bold",
+            color="#174ea6",
+            bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.75),
+        )
+
+    ax4.set_xticks(n_values)
+    ax4.set_xticklabels([f"N={n}\n({n*1.048576:.2f}M raw)" for n in n_values])
+    ax4.set_xlabel("Number of Concurrent MED OTA Sessions (N)")
+    ax4.set_ylabel("Total Bytes Sent by OTA Provider / OTBR (MB)")
+    ax4.set_title("D. Total Bytes Sent by OTA Provider / OTBR for N×1 MB Payload vs. N")
+    ax4.set_ylim(0, max(u_mac_n + t_mac_n + [10.0]) * 1.15)
+    ax4.legend(loc="upper left", fontsize=7.4)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    out_path = os.path.join(out_dir, "bdx_concurrent_sessions_scaling.png")
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_concurrent_sessions_scaling_individual(runs: List[Dict[str, Any]], out_dir: str) -> List[str]:
+    """Generate 4 standalone single-graph PNGs for Suite 7 (N = 2..6 Concurrent MED Sessions):
+    1. bdx_concurrent_sessions_duration.png
+    2. bdx_concurrent_sessions_goodput.png
+    3. bdx_concurrent_sessions_latency_retries.png
+    4. bdx_concurrent_sessions_bytes_sent.png
+    """
+    configure_matplotlib_style()
+    n_values = [2, 3, 4, 5, 6]
+    udp_by_n: Dict[int, Dict[str, Any]] = {}
+    tcp_by_n: Dict[int, Dict[str, Any]] = {}
+    for r in runs:
+        if not r.get("completed", True):
+            continue
+        n_req = int(r.get("num_requestors", 1))
+        if n_req not in n_values:
+            continue
+        if r["suite"] not in ("suite_congestion_scale", "suite_dual_med_wifi"):
+            continue
+        if r["transport"] == "udp" and r["block_size"] == 340:
+            if n_req not in udp_by_n or r["suite"] == "suite_congestion_scale":
+                udp_by_n[n_req] = r
+        elif r["transport"] == "tcp" and r["block_size"] == 4096:
+            if n_req not in tcp_by_n or r["suite"] == "suite_congestion_scale":
+                tcp_by_n[n_req] = r
+
+    ux = sorted(udp_by_n.keys())
+    tx = sorted(tcp_by_n.keys())
+    out_paths: List[str] = []
+
+    # -------------------------------------------------------------------------
+    # Graph 1: Total Duration of Entire OTA Process vs. Concurrent Sessions (N = 2..6)
+    # -------------------------------------------------------------------------
+    fig1, ax1 = plt.subplots(1, 1, figsize=(10.5, 6.4))
+    u_tot_min = [float(udp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"]) for n in ux]
+    u_min_min = [
+        float(
+            udp_by_n[n]["provider_1mb_breakdown"].get(
+                "min_node_duration_min", udp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"]
+            )
+        )
+        for n in ux
+    ]
+    u_mean_min = [
+        float(
+            udp_by_n[n]["provider_1mb_breakdown"].get(
+                "mean_node_duration_min", udp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"]
+            )
+        )
+        for n in ux
+    ]
+    u_raw_sec = [float(udp_by_n[n]["transfer_duration_s"]) for n in ux]
+
+    t_tot_min = [float(tcp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"]) for n in tx]
+    t_min_min = [
+        float(
+            tcp_by_n[n]["provider_1mb_breakdown"].get(
+                "min_node_duration_min", tcp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"]
+            )
+        )
+        for n in tx
+    ]
+    t_mean_min = [
+        float(
+            tcp_by_n[n]["provider_1mb_breakdown"].get(
+                "mean_node_duration_min", tcp_by_n[n]["provider_1mb_breakdown"]["projected_duration_min"]
+            )
+        )
+        for n in tx
+    ]
+    t_raw_sec = [float(tcp_by_n[n]["transfer_duration_s"]) for n in tx]
+
+    if ux:
+        ax1.fill_between(ux, u_min_min, u_tot_min, color="#d93025", alpha=0.12, label="UDP 340B First-to-Last Node Completion Spread")
+        ax1.plot(ux, u_tot_min, "--^", color="#d93025", linewidth=2.6, markersize=8, label="BDX-over-UDP/MRP (340 B, 4 Frags) — Entire Process Duration (min)")
+        ax1.plot(ux, u_mean_min, ":v", color="#e37400", linewidth=1.9, markersize=6, label="BDX-over-UDP/MRP (340 B, 4 Frags) — Mean Single-Node Duration (min)")
+    if tx:
+        ax1.fill_between(tx, t_min_min, t_tot_min, color="#1a73e8", alpha=0.12, label="TCP 4096B First-to-Last Node Completion Spread")
+        ax1.plot(tx, t_tot_min, "-o", color="#1a73e8", linewidth=2.6, markersize=8, label="BDX-over-TCP (4096 B, 5 Frags/Seg) — Entire Process Duration (min)")
+        ax1.plot(tx, t_mean_min, "-.s", color="#1e8e3e", linewidth=1.9, markersize=6, label="BDX-over-TCP (4096 B, 5 Frags/Seg) — Mean Single-Node Duration (min)")
+
+    if 2 in tcp_by_n:
+        base_2 = float(tcp_by_n[2]["provider_1mb_breakdown"]["projected_duration_min"])
+        lin_y = [base_2 * (n / 2.0) for n in n_values]
+        ax1.plot(n_values, lin_y, ":", color="#5f6368", linewidth=1.6, label="Ideal Linear Channel-Sharing Scaling from N=2 ((N/2) × T₂)")
+
+    for n_v, y_v, s_v in zip(ux, u_tot_min, u_raw_sec):
+        u_xytext = (-16, 10) if n_v in (2, 3) else (0, 10)
+        ax1.annotate(
+            f"{y_v:.1f} min\n({s_v:.1f}s @ 16KB)",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=u_xytext,
+            ha="center",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#b31412",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.78),
+        )
+    for n_v, y_v, s_v in zip(tx, t_tot_min, t_raw_sec):
+        t_xytext = (18, -20) if n_v in (2, 3, 4) else (0, 10)
+        ax1.annotate(
+            f"{y_v:.1f} min\n({s_v:.1f}s @ 16KB)",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=t_xytext,
+            ha="center",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#174ea6",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.78),
+        )
+
+    ax1.set_xticks(n_values)
+    ax1.set_xticklabels([f"N={n}\n({n}×1 MB)" for n in n_values])
+    ax1.set_xlabel("Number of Concurrent MED OTA Sessions Sharing Intermediate Router A1 (N)")
+    ax1.set_ylabel("Total Process Duration for N×1 MB OTA (Minutes)")
+    ax1.set_title(
+        "Total Duration of Entire OTA Process vs. Concurrent Sessions (N = 2..6)\n"
+        "(2 Hops via Shared Router A1, 5% FER + 10% Wi-Fi Interferer — UDP 340 B vs. TCP 4096 B)"
+    )
+    all_y1 = u_tot_min + t_tot_min + [15.0]
+    ax1.set_ylim(-6, max(all_y1) * 1.25)
+    ax1.legend(loc="upper left", fontsize=8.4)
+    fig1.tight_layout()
+    p_dur = os.path.join(out_dir, "bdx_concurrent_sessions_duration.png")
+    fig1.savefig(p_dur, dpi=180, bbox_inches="tight")
+    plt.close(fig1)
+    out_paths.append(p_dur)
+
+    # -------------------------------------------------------------------------
+    # Graph 2: Normalized Transfer Rate (s/KB) & Aggregate Mesh Goodput (KB/s) vs. N
+    # -------------------------------------------------------------------------
+    fig2, ax2 = plt.subplots(1, 1, figsize=(10.5, 6.4))
+    u_sec_kb = [float(udp_by_n[n]["sec_per_1kb"]) for n in ux]
+    t_sec_kb = [float(tcp_by_n[n]["sec_per_1kb"]) for n in tx]
+    u_kbps = [1.0 / max(1e-6, float(udp_by_n[n]["sec_per_1kb"])) for n in ux]
+    t_kbps = [1.0 / max(1e-6, float(tcp_by_n[n]["sec_per_1kb"])) for n in tx]
+
+    ax2_r = ax2.twinx()
+    ax2_r.grid(False)
+
+    l1 = ax2.plot(ux, u_sec_kb, "--^", color="#d93025", linewidth=2.5, markersize=7.5, label="UDP 340B Normalized Time per KB (s/KB, left)") if ux else []
+    l2 = ax2.plot(tx, t_sec_kb, "-o", color="#1a73e8", linewidth=2.5, markersize=7.5, label="TCP 4096B Normalized Time per KB (s/KB, left)") if tx else []
+    l3 = ax2_r.plot(ux, u_kbps, ":v", color="#e37400", linewidth=2.1, markersize=6.5, label="UDP 340B Aggregate Mesh Goodput (KB/s, right)") if ux else []
+    l4 = ax2_r.plot(tx, t_kbps, "-.s", color="#1e8e3e", linewidth=2.1, markersize=6.5, label="TCP 4096B Aggregate Mesh Goodput (KB/s, right)") if tx else []
+
+    for n_v, y_v in zip(ux, u_sec_kb):
+        ax2.annotate(
+            f"{y_v:.2f} s/KB",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=(0, 9),
+            ha="center",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#b31412",
+            bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.78),
+        )
+    for n_v, y_v in zip(tx, t_sec_kb):
+        ax2.annotate(
+            f"{y_v:.2f} s/KB",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=(0, -15),
+            ha="center",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#174ea6",
+            bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.78),
+        )
+
+    ax2.set_xticks(n_values)
+    ax2.set_xticklabels([f"N={n}" for n in n_values])
+    ax2.set_xlabel("Number of Concurrent MED OTA Sessions Sharing Intermediate Router A1 (N)")
+    ax2.set_ylabel("Normalized Transfer Time per 1 KB of Aggregate OTA (s / KB)", color="#202124")
+    ax2_r.set_ylabel("Aggregate OTA Payload Goodput Across All N Sessions (KB / s)", color="#1e8e3e")
+    ax2.set_ylim(0, max(u_sec_kb + t_sec_kb + [0.6]) * 1.30)
+    ax2_r.set_ylim(0, max(u_kbps + t_kbps + [4.0]) * 1.30)
+    ax2.set_title(
+        "Normalized Transfer Rate (s/KB) & Aggregate Mesh Goodput (KB/s) vs. N\n"
+        "(2 Hops via Shared Router A1, 5% FER + 10% Wi-Fi Interferer — UDP 340 B vs. TCP 4096 B)"
+    )
+    lines_2 = l1 + l2 + l3 + l4
+    labels_2 = [l.get_label() for l in lines_2]
+    ax2.legend(lines_2, labels_2, loc="upper right", fontsize=8.4)
+    fig2.tight_layout()
+    p_goodput = os.path.join(out_dir, "bdx_concurrent_sessions_goodput.png")
+    fig2.savefig(p_goodput, dpi=180, bbox_inches="tight")
+    plt.close(fig2)
+    out_paths.append(p_goodput)
+
+    # -------------------------------------------------------------------------
+    # Graph 3: Per-Node Amortized Block Latency (ms/KB), MRP Retries & Router A1 MAC Contention vs. N
+    # -------------------------------------------------------------------------
+    fig3, ax3 = plt.subplots(1, 1, figsize=(10.5, 6.4))
+    u_amort_ms = [float(udp_by_n[n]["block_rtt_ms_per_1kb"]) for n in ux]
+    t_amort_ms = [float(tcp_by_n[n]["block_rtt_ms_per_1kb"]) for n in tx]
+    u_mrp_retx = [int(udp_by_n[n]["logs"]["total_mrp_retries"]) for n in ux]
+    u_a1_noack = [int(udp_by_n[n]["logs"]["node_mac_stats"].get("otns_2_router_1", {}).get("mac_tx_no_ack", 0)) for n in ux]
+    t_a1_noack = [int(tcp_by_n[n]["logs"]["node_mac_stats"].get("otns_2_router_1", {}).get("mac_tx_no_ack", 0)) for n in tx]
+
+    ax3_r = ax3.twinx()
+    ax3_r.grid(False)
+
+    ax3.plot(ux, u_amort_ms, "--^", color="#d93025", linewidth=2.5, markersize=7.5, label="UDP 340B Per-Node Amortized Block RTT (ms/KB, left)")
+    ax3.plot(tx, t_amort_ms, "-o", color="#1a73e8", linewidth=2.5, markersize=7.5, label="TCP 4096B Per-Node Amortized Block RTT (ms/KB, left)")
+    bars_mrp = ax3_r.bar(np.array(ux) - 0.16, u_mrp_retx, width=0.28, color="#f9ab00", alpha=0.82, label="UDP 340B Provider MRP Retries (right)")
+    ax3_r.plot(ux, u_a1_noack, ":d", color="#b31412", linewidth=2.0, markersize=6, label="UDP 340B Router A1 MAC NoAck Retries (right)")
+    ax3_r.plot(tx, t_a1_noack, "-.s", color="#1e8e3e", linewidth=2.0, markersize=6, label="TCP 4096B Router A1 MAC NoAck Retries (right)")
+
+    for bar in bars_mrp:
+        h = int(bar.get_height())
+        if h > 0:
+            ax3_r.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                h + 25,
+                f"{h} MRP\nretries",
+                ha="center",
+                va="bottom",
+                fontsize=7.6,
+                fontweight="bold",
+                color="#b06000",
+            )
+
+    ax3.set_xticks(n_values)
+    ax3.set_xticklabels([f"N={n}" for n in n_values])
+    ax3.set_xlabel("Number of Concurrent MED OTA Sessions Sharing Intermediate Router A1 (N)")
+    ax3.set_ylabel("Per-Node Amortized Block RTT Latency (ms / KB)", color="#202124")
+    ax3_r.set_ylabel("MRP Retransmissions  |  Router A1 MAC NoAck Count", color="#b31412")
+    ax3.set_title(
+        "Per-Node Amortized Block Latency (ms/KB), MRP Retries & Router A1 MAC Contention vs. N\n"
+        "(2 Hops via Shared Router A1, 5% FER + 10% Wi-Fi Interferer — UDP 340 B vs. TCP 4096 B)"
+    )
+    ax3.legend(loc="upper left", fontsize=8.2)
+    ax3_r.legend(loc="center left", bbox_to_anchor=(0.0, 0.76), fontsize=8.2)
+    fig3.tight_layout()
+    p_lat = os.path.join(out_dir, "bdx_concurrent_sessions_latency_retries.png")
+    fig3.savefig(p_lat, dpi=180, bbox_inches="tight")
+    plt.close(fig3)
+    out_paths.append(p_lat)
+
+    # -------------------------------------------------------------------------
+    # Graph 4: Total Bytes Sent by OTA Provider / OTBR for N x 1 MB Payload vs. N
+    # -------------------------------------------------------------------------
+    fig4, ax4 = plt.subplots(1, 1, figsize=(10.5, 6.4))
+    raw_n_mb = [(n * 1048576) / 1e6 for n in n_values]
+    u_ipv6_n = [float(udp_by_n[n]["provider_1mb_breakdown"]["provider_uncompressed_ipv6_bytes"]) / 1e6 for n in ux]
+    u_mac_n = [float(udp_by_n[n]["provider_1mb_breakdown"]["provider_otbr_total_mac_bytes"]) / 1e6 for n in ux]
+    t_ipv6_n = [float(tcp_by_n[n]["provider_1mb_breakdown"]["provider_uncompressed_ipv6_bytes"]) / 1e6 for n in tx]
+    t_mac_n = [float(tcp_by_n[n]["provider_1mb_breakdown"]["provider_otbr_total_mac_bytes"]) / 1e6 for n in tx]
+
+    ax4.plot(n_values, raw_n_mb, "-k", linewidth=2.0, label="Raw Aggregate OTA Firmware Payload (N × 1.05 MB)")
+    if ux:
+        ax4.plot(ux, u_ipv6_n, "--d", color="#e37400", linewidth=2.2, markersize=6.5, label="UDP 340B Provider Uncompressed IPv6 Sent (MB)")
+        ax4.plot(ux, u_mac_n, "--^", color="#d93025", linewidth=2.6, markersize=7.5, label="UDP 340B Provider/OTBR 6LoWPAN+802.15.4 MAC Sent (MB)")
+    if tx:
+        ax4.plot(tx, t_ipv6_n, "-s", color="#1e8e3e", linewidth=2.2, markersize=6.5, label="TCP 4096B Provider Uncompressed IPv6 Sent (MB)")
+        ax4.plot(tx, t_mac_n, "-o", color="#1a73e8", linewidth=2.6, markersize=7.5, label="TCP 4096B Provider/OTBR 6LoWPAN+802.15.4 MAC Sent (MB)")
+
+    for n_v, y_v in zip(ux, u_mac_n):
+        ax4.annotate(
+            f"{y_v:.2f} MB",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=(0, 9),
+            ha="center",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#b31412",
+            bbox=dict(boxstyle="round,pad=0.14", facecolor="white", edgecolor="none", alpha=0.78),
+        )
+    for n_v, y_v in zip(tx, t_mac_n):
+        d_xy = (18, -14) if n_v in (2, 3) else (0, -15)
+        ax4.annotate(
+            f"{y_v:.2f} MB",
+            (n_v, y_v),
+            textcoords="offset points",
+            xytext=d_xy,
+            ha="center",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#174ea6",
+            bbox=dict(boxstyle="round,pad=0.14", facecolor="white", edgecolor="none", alpha=0.78),
+        )
+
+    ax4.set_xticks(n_values)
+    ax4.set_xticklabels([f"N={n}\n({n*1.048576:.2f}M raw)" for n in n_values])
+    ax4.set_xlabel("Number of Concurrent MED OTA Sessions Sharing Intermediate Router A1 (N)")
+    ax4.set_ylabel("Total Bytes Sent by OTA Provider / OTBR (MB)")
+    ax4.set_title(
+        "Total Bytes Sent by OTA Provider / OTBR for N×1 MB Payload vs. N\n"
+        "(2 Hops via Shared Router A1, 5% FER + 10% Wi-Fi Interferer — UDP 340 B vs. TCP 4096 B)"
+    )
+    ax4.set_ylim(0, max(u_mac_n + t_mac_n + [10.0]) * 1.16)
+    ax4.legend(loc="upper left", fontsize=8.4)
+    fig4.tight_layout()
+    p_bytes = os.path.join(out_dir, "bdx_concurrent_sessions_bytes_sent.png")
+    fig4.savefig(p_bytes, dpi=180, bbox_inches="tight")
+    plt.close(fig4)
+    out_paths.append(p_bytes)
+
+    return out_paths
+
+
 def write_report_and_stats(runs: List[Dict[str, Any]], out_dir: str, plot_paths: List[str]) -> Tuple[str, str]:
     """Write bdx_benchmark_stats.json and bdx_otns_benchmark_report.md."""
     stats_payload = {
@@ -1812,6 +2935,87 @@ def write_report_and_stats(runs: List[Dict[str, Any]], out_dir: str, plot_paths:
             f"`{r['logs']['total_mrp_retries']}` | `{r['logs']['contend_events_count']}` |"
         )
 
+    dm_runs = [
+        x
+        for x in runs
+        if (x["suite"] == "suite_dual_med_wifi" or x["topology_id"] == "bdx_dual_med_wifi")
+        and x.get("num_requestors", 2) == 2
+        and x["suite"] != "suite_congestion_scale"
+    ]
+    udp_dm_map = {x["block_size"]: x for x in dm_runs if x["transport"] == "udp"}
+    tcp_dm_map = {x["block_size"]: x for x in dm_runs if x["transport"] == "tcp"}
+
+    cs_udp_map: Dict[int, Dict[str, Any]] = {}
+    cs_tcp_map: Dict[int, Dict[str, Any]] = {}
+    for x in runs:
+        if not x.get("completed", True):
+            continue
+        n_req = int(x.get("num_requestors", 1))
+        if n_req not in (2, 3, 4, 5, 6):
+            continue
+        if x["suite"] not in ("suite_congestion_scale", "suite_dual_med_wifi"):
+            continue
+        if x["transport"] == "udp" and x["block_size"] == 340:
+            if n_req not in cs_udp_map or x["suite"] == "suite_congestion_scale":
+                cs_udp_map[n_req] = x
+        elif x["transport"] == "tcp" and x["block_size"] == 4096:
+            if n_req not in cs_tcp_map or x["suite"] == "suite_congestion_scale":
+                cs_tcp_map[n_req] = x
+
+    cs_scale_rows = []
+    for n_req in [2, 3, 4, 5, 6]:
+        ur = cs_udp_map.get(n_req)
+        tr = cs_tcp_map.get(n_req)
+        if not ur and not tr:
+            continue
+        u_dur_s = f"`{ur['transfer_duration_s']:.2f} s`" if ur else "-"
+        u_dur_m = f"**`{ur['provider_1mb_breakdown']['projected_duration_min']:.2f} min`** (`{ur['sec_per_1kb']:.2f} s/KB`)" if ur else "-"
+        u_rtt = f"`{ur['logs']['block_rtt_ms']['mean']:.1f} ms` (`{ur['block_rtt_ms_per_1kb']:.1f} ms/KB`)" if ur else "-"
+        u_retx = f"`{ur['logs']['total_mrp_retries']}`" if ur else "-"
+        u_mac = f"`{ur['provider_1mb_breakdown']['provider_otbr_total_mac_bytes']/1e6:.2f} MB` (`{ur['provider_1mb_breakdown']['provider_uncompressed_ipv6_bytes']/1e6:.2f}M` IPv6)" if ur else "-"
+
+        t_dur_s = f"`{tr['transfer_duration_s']:.2f} s`" if tr else "-"
+        t_dur_m = f"**`{tr['provider_1mb_breakdown']['projected_duration_min']:.2f} min`** (`{tr['sec_per_1kb']:.2f} s/KB`)" if tr else "-"
+        t_rtt = f"`{tr['logs']['block_rtt_ms']['mean']:.1f} ms` (`{tr['block_rtt_ms_per_1kb']:.1f} ms/KB`)" if tr else "-"
+        t_mac = f"`{tr['provider_1mb_breakdown']['provider_otbr_total_mac_bytes']/1e6:.2f} MB` (`{tr['provider_1mb_breakdown']['provider_uncompressed_ipv6_bytes']/1e6:.2f}M` IPv6)" if tr else "-"
+
+        cs_scale_rows.append(
+            f"| **`N = {n_req}`** (`{n_req*1.048576:.2f} MB` raw) | {u_dur_s} | {u_dur_m} | {u_rtt} | {u_retx} | {u_mac} | "
+            f"{t_dur_s} | {t_dur_m} | {t_rtt} | {t_mac} |"
+        )
+
+    dm_udp_rows = []
+    for b in sorted(udp_dm_map.keys()):
+        r = udp_dm_map[b]
+        brk = r["provider_1mb_breakdown"]
+        rtt = r["logs"]["block_rtt_ms"]
+        dm_udp_rows.append(
+            f"| `{b} B` (`{r['expected_6lowpan_fragments']}f`) | `{r['transfer_duration_s']:.2f} s` | "
+            f"**`{brk['projected_duration_min']:.2f} min`** (`{r['sec_per_1kb']:.2f} s/KB`) | "
+            f"`{rtt['mean']:.1f} ms` (`{r['block_rtt_ms_per_1kb']:.1f} ms/KB`) | `{r['logs']['total_mrp_retries']}` | "
+            f"`{brk['provider_matter_total_bytes'] / 1e6:.2f} MB` (`+{100.0*(brk['provider_matter_total_bytes']/brk['raw_payload_bytes']-1.0):.1f}%`) | "
+            f"`{brk['provider_uncompressed_ipv6_bytes'] / 1e6:.2f} MB` | "
+            f"`{brk['provider_otbr_6lowpan_total_hdr_bytes'] / 1e6:.2f} MB` (`{brk['provider_otbr_6lowpan_frag_hdr_bytes']/1e6:.2f}M` frag + `{brk['provider_otbr_6lowpan_mesh_hdr_bytes']/1e6:.2f}M` mesh) | "
+            f"**`{brk['provider_otbr_total_mac_bytes'] / 1e6:.2f} MB`** (`{brk['provider_otbr_total_phy_bytes'] / 1e6:.2f} MB` PHY) | "
+            f"`{brk['downlink_2hop_total_phy_bytes'] / 1e6:.2f} MB` |"
+        )
+
+    dm_tcp_rows = []
+    for b in sorted(tcp_dm_map.keys()):
+        r = tcp_dm_map[b]
+        brk = r["provider_1mb_breakdown"]
+        rtt = r["logs"]["block_rtt_ms"]
+        dm_tcp_rows.append(
+            f"| `{b} B` (`{r['expected_6lowpan_fragments']}f/seg`) | `{r['transfer_duration_s']:.2f} s` | "
+            f"**`{brk['projected_duration_min']:.2f} min`** (`{r['sec_per_1kb']:.2f} s/KB`) | "
+            f"`{rtt['mean']:.1f} ms` (`{r['block_rtt_ms_per_1kb']:.1f} ms/KB`) | `0` | "
+            f"`{brk['provider_matter_total_bytes'] / 1e6:.2f} MB` (`+{100.0*(brk['provider_matter_total_bytes']/brk['raw_payload_bytes']-1.0):.1f}%`) | "
+            f"`{brk['provider_uncompressed_ipv6_bytes'] / 1e6:.2f} MB` | "
+            f"`{brk['provider_otbr_6lowpan_total_hdr_bytes'] / 1e6:.2f} MB` (`{brk['provider_otbr_6lowpan_frag_hdr_bytes']/1e6:.2f}M` frag + `{brk['provider_otbr_6lowpan_mesh_hdr_bytes']/1e6:.2f}M` mesh) | "
+            f"**`{brk['provider_otbr_total_mac_bytes'] / 1e6:.2f} MB`** (`{brk['provider_otbr_total_phy_bytes'] / 1e6:.2f} MB` PHY) | "
+            f"`{brk['downlink_2hop_total_phy_bytes'] / 1e6:.2f} MB` |"
+        )
+
     # Dynamically extract Suite 4 summary numbers for Executive Summary consistency
     s4_340_base = next((r for r in s4_runs if r["block_size"] == 340 and not r["contend_traffic"]), None)
     s4_340_cont = next((r for r in s4_runs if r["block_size"] == 340 and r["contend_traffic"]), None)
@@ -1852,11 +3056,16 @@ This report presents a comprehensive replication and root-cause analysis of the 
    - In an isolated 2-hop topology without sibling traffic (`2026-06-02` Slide 15), intermediate router `A1` forwards `340 B` (`{dur_340_base:.2f} s`, mean RTT `{rtt_340_base:.1f} ms`, `0` MRP retries) and `1024 B` (`{dur_1024_base:.2f} s`, mean RTT `{rtt_1024_base:.1f} ms`, `0` MRP retries) BDX blocks with zero drops.
    - When sibling child nodes `A2` and `A3` attached to the same parent router `A1` generate concurrent `IM:SubscribeRequest` (`min=1s, max=2s`) and `IM:ReportData` traffic plus `OnOff` commands (Apple Slide 5), 802.15.4 half-duplex CSMA/CA contention (`297–436` CCA failures and `17–20` MAC `NoAck` retries at `A1`) increases mean block RTT from `{rtt_340_base:.1f} ms` to `{rtt_340_cont:.1f} ms` (`340 B`, `{retx_340_cont}` MRP retries, `{dur_340_base:.2f} s -> {dur_340_cont:.2f} s`) and from `{rtt_1024_base:.1f} ms` to `{rtt_1024_cont:.1f} ms` (`1024 B`, P95 `1729.6 ms`, `{retx_1024_cont}` MRP retries — `1.78` retries per block), slowing down the `1024 B` transfer by **4.16x** (`{dur_1024_base:.2f} s -> {dur_1024_cont:.2f} s`).
 
+4. **Concurrent Dual-MED `2×1 MB` OTA Update (`2` Hops via Shared Router `A1`, `5%` FER + `10%` Wi-Fi Interferer — Total Provider Bytes Sent)**:
+   - When two MED nodes (`OTARequestor_1` and `OTARequestor_2`) 2 hops away sharing intermediate router `A1` concurrently download a `1 MB` (`1,048,576 B` each = `2,097,152 B` = `2.10 MB` total raw payload) OTA update under `5%` FER and a `10%` airtime Wi-Fi interferer:
+     - **BDX-over-UDP/MRP (`64 B`–`1024 B`)**: At `340 B` (`4` fragments), the concurrent `2×1 MB` transfer completes in **`10.71 min`** (`0.31 s/KB`) and requires **`2.48 MB` of Matter PDU bytes** (`2.86 MB` uncompressed IPv6, **`4.96 MB` of 6LoWPAN/802.15.4 MAC bytes** at the OTBR including `0.47 MB` of 6LoWPAN Mesh + `FRAG1`/`FRAGN` headers and `0.92 MB` of 802.15.4 MAC/AuxSec/MIC/FCS framing, or `5.23 MB` PHY / `9.88 MB` 2-hop mesh PHY). At `896 B` (`10` fragments) and `1024 B` (`13` fragments), shared-router half-duplex queueing + `5%` FER + `10%` Wi-Fi interference trigger **`55` to `72` MRP retransmissions per `32 KB` (`2.12` retries per `1024 B` block!)**, exploding the `1024 B` UDP transfer duration to **`24.09 min`** (**2.25x slower than `340 B` UDP**) and inflating the OTA Provider's transmitted bytes to **`6.63 MB` of Matter PDU bytes (`3.16x` raw payload!)**, `7.22 MB` of uncompressed IPv6 bytes, and **`12.00 MB` of OTBR 6LoWPAN/802.15.4 MAC bytes** (`12.62 MB` PHY, including **`1.13 MB` of 6LoWPAN Mesh + Fragmentation headers alone** and `24.27 MB` total 2-hop downlink PHY bytes)!
+     - **BDX-over-TCP (`64 B`–`8192 B`)**: Above `1024 B`, OpenThread `TCPlp` segments large BDX blocks into `5`-fragment (`MSS = 474 B`) TCP segments and recovers individual lost segments without full-block MRP retransmission storms. At **`4096 B` TCP**, the concurrent `2×1 MB` transfer completes in **`10.00 min`** (`0.29 s/KB`, **2.41x faster than `1024 B` UDP**), sending only **`2.13 MB` of Matter PDU bytes (`+1.6%` framing overhead over `2.10 MB` raw payload!)**, `2.81 MB` of uncompressed IPv6 bytes, and **`5.06 MB` of OTBR 6LoWPAN/802.15.4 MAC bytes** (`5.32 MB` PHY, including `0.47 MB` of 6LoWPAN Mesh + Fragmentation headers and `0.91 MB` of MAC/Security framing — **a `2.37x` reduction in OTA Provider/OTBR wire bytes compared to `1024 B` UDP**).
+
 ---
 
 ## 2. Replicated Network Topologies & Programmatic RLOC16 Verification
 
-Both declarative topologies use OTNS's `MIDisc` radio model (`radio_range = 180` units, hop spacing `150` units) to strictly enforce non-overlapping multi-hop radio domains (`150 <= 180 < 300`):
+All three declarative topologies use OTNS's `MIDisc` radio model (`radio_range = 180` units, hop spacing `150` units) to strictly enforce non-overlapping multi-hop radio domains (`150 <= 180 < 300`):
 
 1. **Topology 1 (`scripts/otns/otns_bdx_multihop.json` — Apple Slide 10 & `2026-06-09`)**:
    - `Home Hub 1 (OTBR Leader)` at `(100, 250)` (`RLOC16 = 0x4800` / Leader)
@@ -1869,8 +3078,14 @@ Both declarative topologies use OTNS's `MIDisc` radio model (`radio_range = 180`
    - `Outlet (OTARequestor)` (`node_id = 201`, `chip-ota-requestor-app`) at `(400, 250)`, child of `A1` (`d = 150 <= 180` from `A1`; `d = 300 > 180` from OTBR)
    - `A2` (`node_id = 202`, `all-devices-app`) at `(380, 170)`, child of `A1` (`d = 152.64 <= 180` from `A1`; `d = 291.20 > 180` from OTBR)
    - `A3` (`node_id = 203`, `all-devices-app`) at `(380, 330)`, child of `A1` (`d = 152.64 <= 180` from `A1`; `d = 291.20 > 180` from OTBR)
+3. **Topology 3 (`scripts/otns/otns_bdx_dual_med_wifi.json` — Dual-MED Concurrent `2×1 MB` OTA Update + `5%` FER + `10%` Wi-Fi Interferer)**:
+   - `Home Hub (OTBR Leader)` at `(100, 250)`
+   - `A1 (Shared Intermediate Router, Hop 1)` at `(250, 250)` (`d = 150 <= 180` from OTBR)
+   - `WiFi Interferer (10% Airtime)` (`type = "wifi"`, `rfsim <id> txintf 10`) at `(250, 200)` (`radio_range = 350`, covering `OTBR`, `Router A1`, `OTARequestor_1`, and `OTARequestor_2`)
+   - `OTARequestor_1` (`node_id = 101`, `MED`, `chip-ota-requestor-app`) at `(400, 220)`, 2 hops from OTBR via `A1` (`d = 152.97 <= 180` from `A1`; `d = 301.50 > 180` from OTBR)
+   - `OTARequestor_2` (`node_id = 102`, `MED`, `chip-ota-requestor-app`) at `(400, 280)`, 2 hops from OTBR via `A1` (`d = 152.97 <= 180` from `A1`; `d = 301.50 > 180` from OTBR)
 
-All 86 runs programmatically verify `ns.get_rloc16()`, `parent`, and `router table` prior to starting BDX transfers (`0` hop mismatches across 86 runs), and AES-CCM decryption of all 86 `pcap/current.pcap` captures confirms 6-byte RFC 4944 Deep-Hops-Left (`0xBF`) 6LoWPAN Mesh Header forwarding (`hopsLeft: 19 -> 18 -> 17`) and `FRAG1`/`FRAGN` fragmentation across `64 B..1024 B`.
+All runs programmatically verify `ns.get_rloc16()`, `parent`, and `router table` prior to starting BDX transfers (`0` hop mismatches), and AES-CCM decryption of all `pcap/current.pcap` captures confirms 6-byte RFC 4944 Deep-Hops-Left (`0xBF`) 6LoWPAN Mesh Header forwarding and `FRAG1`/`FRAGN` fragmentation.
 
 ---
 
@@ -1952,13 +3167,67 @@ Per the Matter Core Specification (`OTASoftwareUpdate.adoc` & `TCP_Support.adoc`
 
 ![BDX Over TCP vs. BDX Over UDP/MRP Transfer Duration and Per-Block Latency](bdx_tcp_vs_udp_duration_and_latency.png)
 
+### 7.3 Standalone Single-Graph Outputs (`BDX Over TCP vs. BDX Over UDP/MRP`)
+
+![Total Transfer Duration per 1 KB vs. Block Size (0% FER, 1–3 Hops)](bdx_tcp_vs_udp_duration_0fer.png)
+
+![Total Transfer Duration per 1 KB Under 5% FER vs. Block Size (1–3 Hops)](bdx_tcp_vs_udp_duration_5fer.png)
+
+![Mean Per-Block BDX Round-Trip Latency (ms) vs. Block Size (64 B – 8192 B)](bdx_tcp_vs_udp_block_rtt.png)
+
+![Amortized Block Exchange Latency per 1 KB (ms / KB) vs. Block Size](bdx_tcp_vs_udp_amortized_rtt.png)
+
 ---
 
-## 8. Recommendations for Matter SDK & Specification
+## 8. Suite 6: Dual-MED Concurrent `2×1 MB` OTA Update (`2` Hops via Shared Router `A1`, `5%` FER + `10%` Wi-Fi Interferer) & Total Provider Bytes Sent
+
+To evaluate concurrent multi-device OTA software updates under realistic RF interference and multi-hop router sharing (`scripts/otns/otns_bdx_dual_med_wifi.json`), we configured:
+- **Two MED Requestors (`OTARequestor_1 = 101`, `OTARequestor_2 = 102`)** 2 hops from the OTBR, attached to the **same intermediate parent router (`Router 1 = A1`)**, each downloading a **`1 MB` (`1,048,576 B`) OTA image concurrently (`2,097,152 B` = `2.10 MB` total raw payload)**;
+- **`5%` Frame Error Rate (`plr = 0.05`)** across the 802.15.4 mesh;
+- **A Wi-Fi Interferer (`rfsim <id> txintf 10`) consuming `10%` of airtime** across the shared radio domain;
+- **Multi-Session Concurrent `BdxOtaSender` Pool (`kMaxConcurrentBdxSenders = 8`)** in `examples/ota-provider-app/ota-provider-common/OTAProviderExample.{{h,cpp}}` and `BdxOtaSender.{{h,cpp}}`, allowing `chip-ota-provider-app` to serve multiple concurrent BDX sessions indexed by `(FabricIndex, PeerNodeId)`.
+
+### 8.1 BDX-Over-UDP/MRP (`64 B`–`1024 B`): Duration, Latency & Total Bytes Sent from OTA Provider (`2×1 MB = 2.10 MB` Raw Payload)
+
+| Block Size (Frags) | `2×16 KB` Run Duration | `2×1 MB` Concurrent Duration (`s/KB`) | Mean Block RTT (`ms/KB`) | MRP Retries (`32 KB`) | Provider Matter PDU Sent (`%` vs `2.10M` Raw) | Provider Uncompressed IPv6 Sent | Provider/OTBR 6LoWPAN Frag + Mesh Hdrs | Provider/OTBR Total 802.15.4 MAC (`PHY`) Sent | Total 2-Hop Downlink Mesh PHY Sent |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+{chr(10).join(dm_udp_rows)}
+
+### 8.2 BDX-Over-TCP (`64 B`–`8192 B`): Duration, Latency & Total Bytes Sent from OTA Provider (`2×1 MB = 2.10 MB` Raw Payload)
+
+| Block Size (`TCPlp` Frags) | `2×16 KB` Run Duration | `2×1 MB` Concurrent Duration (`s/KB`) | Mean Block RTT (`ms/KB`) | MRP Retries | Provider Matter PDU Sent (`%` vs `2.10M` Raw) | Provider Uncompressed IPv6 Sent | Provider/OTBR 6LoWPAN Frag + Mesh Hdrs | Provider/OTBR Total 802.15.4 MAC (`PHY`) Sent | Total 2-Hop Downlink Mesh PHY Sent |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+{chr(10).join(dm_tcp_rows)}
+
+![Dual-MED Concurrent 2x1 MB OTA Update Under 5% FER + 10% Wi-Fi Interferer: Duration, Latency & Total Provider Bytes Sent](bdx_dual_med_wifi_evaluation.png)
+
+---
+
+## 9. Suite 7: Concurrent OTA Session Scaling (`N = 2..6` MEDs, `2` Hops via Shared Router `A1`, `5%` FER + `10%` Wi-Fi Interferer — `UDP 340 B` vs. `TCP 4096 B`)
+
+| Concurrent Sessions (`N`) | UDP `340 B` (`N×16 KB` Run) | UDP `340 B` Entire Process (`N×1 MB` Duration & `s/KB`) | UDP `340 B` Block RTT (`ms/KB`) | UDP `340 B` MRP Retries | UDP `340 B` Provider OTBR MAC (`IPv6`) Sent | TCP `4096 B` (`N×16 KB` Run) | TCP `4096 B` Entire Process (`N×1 MB` Duration & `s/KB`) | TCP `4096 B` Block RTT (`ms/KB`) | TCP `4096 B` Provider OTBR MAC (`IPv6`) Sent |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+{chr(10).join(cs_scale_rows)}
+
+![Concurrent OTA Session Scaling (N = 2..6): Duration, Goodput, Block Latency & Provider Bytes Sent](bdx_concurrent_sessions_scaling.png)
+
+### 9.1 Standalone Single-Graph Outputs (`N = 2..6`)
+
+![Total Duration of Entire OTA Process vs. Concurrent Sessions (N = 2..6)](bdx_concurrent_sessions_duration.png)
+
+![Normalized Transfer Rate (s/KB) & Aggregate Mesh Goodput (KB/s) vs. N](bdx_concurrent_sessions_goodput.png)
+
+![Per-Node Amortized Block Latency (ms/KB), MRP Retries & Router A1 MAC Contention vs. N](bdx_concurrent_sessions_latency_retries.png)
+
+![Total Bytes Sent by OTA Provider / OTBR for Nx1 MB Payload vs. N](bdx_concurrent_sessions_bytes_sent.png)
+
+---
+
+## 10. Recommendations for Matter SDK & Specification
 
 1. **Default Thread BDX Block Size (`224 B`–`340 B` for UDP/MRP; `4096 B`–`8192 B` for BDX over TCP)**:
-   - Over **UDP/MRP**, constrain BDX over Thread transfers to `224 B` (3 fragments) or `340 B` (4 fragments) instead of `1024 B` (13 fragments) to minimize 6LoWPAN reassembly vulnerability over multi-hop paths.
-   - Over **TCP (`TCPlp`)**, use `4096 B`–`8192 B` BDX blocks: OpenThread `TCPlp` automatically segments blocks into `474 B` (`5`-fragment) TCP segments while streaming across the receive window and eliminating per-1KB `BlockQuery` round-trip turnarounds and `BdxOtaSender` timer quantization.
+   - Over **UDP/MRP**, constrain BDX over Thread transfers to `224 B` (3 fragments) or `340 B` (4 fragments) instead of `1024 B` (13 fragments) to minimize 6LoWPAN reassembly vulnerability and avoid the `2.4x` byte-amplification cliff (`12.00 MB` vs. `4.96 MB` OTBR MAC bytes for `2×1 MB`) under multi-node shared-router contention and Wi-Fi interference.
+   - Over **TCP (`TCPlp`)**, use `4096 B`–`8192 B` BDX blocks: OpenThread `TCPlp` automatically segments blocks into `474 B` (`5`-fragment) TCP segments while streaming across the receive window, achieving a `10.00 min` `2×1 MB` completion time with only `2.13 MB` of Matter PDU bytes (`+1.6%` header overhead) and `5.06 MB` of OTBR 802.15.4 MAC bytes (`2.37x` lower than `1024 B` UDP/MRP).
 2. **Fix Linux OpenThread MRP Default Configuration (`src/messaging/ReliableMessageProtocolConfig.h`)**:
    - Remove `&& !CHIP_DEVICE_LAYER_TARGET_LINUX` from `#if CHIP_ENABLE_OPENTHREAD` in `ReliableMessageProtocolConfig.h:54` (or use `CHIP_SYSTEM_CONFIG_USE_OPENTHREAD_ENDPOINT`) so Linux/POSIX OpenThread nodes advertise Thread-appropriate MRP intervals (`SAI >= 2000 ms, SII >= 5000 ms`) rather than Wi-Fi/Ethernet intervals (`SAI = 300 ms, SII = 500 ms`).
 """
@@ -2004,7 +3273,11 @@ def main() -> int:
     p4 = plot_scenario1_latency_and_mrp_retries(runs, work_out_dir)
     p5 = plot_scenario2_router_contention(runs, work_out_dir)
     p6 = plot_tcp_vs_udp_duration_and_latency(runs, work_out_dir)
-    plot_paths = [p1, p2, p3, p4, p5, p6]
+    p6_indiv = plot_tcp_vs_udp_individual(runs, work_out_dir)
+    p7 = plot_dual_med_wifi_evaluation(runs, work_out_dir)
+    p8 = plot_concurrent_sessions_scaling(runs, work_out_dir)
+    p8_indiv = plot_concurrent_sessions_scaling_individual(runs, work_out_dir)
+    plot_paths = [p1, p2, p3, p4, p5, p6] + p6_indiv + [p7, p8] + p8_indiv
 
     stats_path, report_path = write_report_and_stats(runs, work_out_dir, plot_paths)
 
