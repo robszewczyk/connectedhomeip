@@ -140,6 +140,7 @@ class BdxTopologyConfig:
     otbr_name: str
     routers: List[Dict[str, Any]]
     matter_nodes: List[BdxMatterNodeSpec]
+    wifi_interferers: List[Dict[str, Any]] = field(default_factory=list)
     provider_node_id: int = 999
     provider_discriminator: int = 2222
     provider_passcode: int = 20202021
@@ -158,6 +159,7 @@ def load_bdx_topology(
     large_payload: bool = False,
     requestor_sai_ms: Optional[int] = None,
     requestor_sii_ms: Optional[int] = None,
+    num_requestors: Optional[int] = None,
 ) -> BdxTopologyConfig:
     """Load and parameterize a BDX declarative topology JSON file."""
     with open(config_path, "r", encoding="utf-8") as f:
@@ -177,6 +179,7 @@ def load_bdx_topology(
     prov_pass = int(prov_cfg.get("passcode", 20202021))
 
     all_routers = list(raw.get("routers", []))
+    wifi_interferers = list(raw.get("wifi_interferers", []))
     hop_placements = raw.get("hop_placements") or raw.get("hop_presets") or {}
     if str(hops) in hop_placements:
         hp = hop_placements[str(hops)]
@@ -189,8 +192,54 @@ def load_bdx_topology(
         req_override_x = None
         req_override_y = None
 
+    raw_matter_nodes = list(raw.get("matter_nodes", []))
+    if num_requestors is not None and num_requestors >= 1:
+        sibling_items = [
+            item
+            for item in raw_matter_nodes
+            if "all-devices" in str(item.get("app_type") or item.get("app") or "ota-requestor")
+        ]
+        template_req = next(
+            (
+                item
+                for item in raw_matter_nodes
+                if "all-devices" not in str(item.get("app_type") or item.get("app") or "ota-requestor")
+            ),
+            {},
+        )
+        base_x = req_override_x if req_override_x is not None else int(template_req.get("x", 400))
+        if num_requestors == 1:
+            ys = [req_override_y if req_override_y is not None else 250]
+        elif num_requestors == 2:
+            ys = [220, 280]
+        else:
+            ys = [int(round(175 + i * (150.0 / (num_requestors - 1)))) for i in range(num_requestors)]
+
+        gen_req_items: List[Dict[str, Any]] = []
+        for i in range(num_requestors):
+            nid = 101 + i
+            gen_req_items.append(
+                {
+                    "name": f"OTARequestor_{i + 1}",
+                    "role": "ota_requestor",
+                    "app": "ota-requestor-app",
+                    "node_id": nid,
+                    "discriminator": 3840 + 2 * i,
+                    "passcode": int(template_req.get("passcode", 20202021)),
+                    "x": base_x,
+                    "y": ys[i],
+                    "radio_range": int(template_req.get("radio_range", 180)),
+                    "router_eligible": False,
+                    "thread_mode": mode.lower(),
+                    "poll_period_ms": poll_period_ms,
+                    "ota_download_path": f"/tmp/ota_dl_{nid}.bin",
+                    "devices": [],
+                }
+            )
+        raw_matter_nodes = gen_req_items + sibling_items
+
     matter_nodes: List[BdxMatterNodeSpec] = []
-    for idx, item in enumerate(raw.get("matter_nodes", [])):
+    for idx, item in enumerate(raw_matter_nodes):
         nid = int(item.get("node_id", 101 + idx))
         raw_app = str(item.get("app_type") or item.get("app") or "ota-requestor")
         app_type = "all-devices" if "all-devices" in raw_app else "ota-requestor"
@@ -237,6 +286,7 @@ def load_bdx_topology(
         otbr_name=otbr_name,
         routers=routers,
         matter_nodes=matter_nodes,
+        wifi_interferers=wifi_interferers,
         provider_node_id=prov_node_id,
         provider_discriminator=prov_disc,
         provider_passcode=prov_pass,
@@ -251,6 +301,13 @@ def get_saved_state_dir(topo_cfg: BdxTopologyConfig) -> str:
     node_ids_slug = "_".join(str(n.node_id) for n in topo_cfg.matter_nodes)
     key = sanitize_slug(f"{topo_cfg.topology_id}_r{len(topo_cfg.routers)}_n{node_ids_slug}")
     return f"/tmp/saved_commissioned_state_{key}"
+
+
+def get_persistent_saved_state_dir(topo_cfg: BdxTopologyConfig) -> str:
+    """Return a workspace-persisted KVS cache directory so parallel containers can reuse commissioned state."""
+    node_ids_slug = "_".join(str(n.node_id) for n in topo_cfg.matter_nodes)
+    key = sanitize_slug(f"{topo_cfg.topology_id}_r{len(topo_cfg.routers)}_n{node_ids_slug}")
+    return os.path.join(DEFAULT_SIM_LOGS_DIR, f".saved_commissioned_state_{key}")
 
 
 def _strip_persisted_subscriptions_and_ota_state(kvs_path: str) -> None:
@@ -275,42 +332,48 @@ def _strip_persisted_subscriptions_and_ota_state(kvs_path: str) -> None:
 
 def save_bdx_commissioned_state(topo_cfg: BdxTopologyConfig) -> None:
     """Save commissioned KVS files for Requestor/sibling nodes, OTA Provider, and chip-tool."""
-    state_dir = get_saved_state_dir(topo_cfg)
-    os.makedirs(state_dir, exist_ok=True)
-    for node in topo_cfg.matter_nodes:
-        src = f"/tmp/chip_kvs_otns_{node.node_id}"
-        if os.path.isfile(src):
-            _strip_persisted_subscriptions_and_ota_state(src)
-            dst = os.path.join(state_dir, os.path.basename(src))
-            shutil.copy2(src, dst)
-            _strip_persisted_subscriptions_and_ota_state(dst)
-    if os.path.isfile(OTA_PROVIDER_KVS_PATH):
-        shutil.copy2(OTA_PROVIDER_KVS_PATH, os.path.join(state_dir, os.path.basename(OTA_PROVIDER_KVS_PATH)))
-    for ini_path in glob.glob("/tmp/chip_*.ini"):
-        if os.path.isfile(ini_path):
-            shutil.copy2(ini_path, os.path.join(state_dir, os.path.basename(ini_path)))
-    if os.path.isdir("/tmp/chip_tool_kvs"):
-        dst_kvs = os.path.join(state_dir, "chip_tool_kvs")
-        os.makedirs(dst_kvs, exist_ok=True)
-        for item in os.listdir("/tmp/chip_tool_kvs"):
-            s = os.path.join("/tmp/chip_tool_kvs", item)
-            d = os.path.join(dst_kvs, item)
-            if os.path.isfile(s):
-                shutil.copy2(s, d)
+    for state_dir in (get_saved_state_dir(topo_cfg), get_persistent_saved_state_dir(topo_cfg)):
+        os.makedirs(state_dir, exist_ok=True)
+        for node in topo_cfg.matter_nodes:
+            src = f"/tmp/chip_kvs_otns_{node.node_id}"
+            if os.path.isfile(src):
+                _strip_persisted_subscriptions_and_ota_state(src)
+                dst = os.path.join(state_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                _strip_persisted_subscriptions_and_ota_state(dst)
+        if os.path.isfile(OTA_PROVIDER_KVS_PATH):
+            shutil.copy2(OTA_PROVIDER_KVS_PATH, os.path.join(state_dir, os.path.basename(OTA_PROVIDER_KVS_PATH)))
+        for ini_path in glob.glob("/tmp/chip_*.ini"):
+            if os.path.isfile(ini_path):
+                shutil.copy2(ini_path, os.path.join(state_dir, os.path.basename(ini_path)))
+        if os.path.isdir("/tmp/chip_tool_kvs"):
+            dst_kvs = os.path.join(state_dir, "chip_tool_kvs")
+            os.makedirs(dst_kvs, exist_ok=True)
+            for item in os.listdir("/tmp/chip_tool_kvs"):
+                s = os.path.join("/tmp/chip_tool_kvs", item)
+                d = os.path.join(dst_kvs, item)
+                if os.path.isfile(s):
+                    shutil.copy2(s, d)
 
 
 def restore_bdx_commissioned_state(topo_cfg: BdxTopologyConfig) -> bool:
     """Restore commissioned KVS files from topology-scoped cache if complete."""
     state_dir = get_saved_state_dir(topo_cfg)
     if not os.path.isdir(state_dir):
-        node_ids_slug = "_".join(str(n.node_id) for n in topo_cfg.matter_nodes)
-        pattern = f"/tmp/saved_commissioned_state_{sanitize_slug(topo_cfg.topology_id)}_r*_n{sanitize_slug(node_ids_slug)}"
-        candidates = sorted(glob.glob(pattern))
-        if candidates:
-            state_dir = candidates[0]
+        persisted_dir = get_persistent_saved_state_dir(topo_cfg)
+        if os.path.isdir(persisted_dir):
+            state_dir = persisted_dir
         else:
-            return False
+            node_ids_slug = "_".join(str(n.node_id) for n in topo_cfg.matter_nodes)
+            pattern = f"/tmp/saved_commissioned_state_{sanitize_slug(topo_cfg.topology_id)}_r*_n{sanitize_slug(node_ids_slug)}"
+            candidates = sorted(glob.glob(pattern))
+            if candidates:
+                state_dir = candidates[0]
+            else:
+                return False
     for item in os.listdir(state_dir):
+        if item in ("var_lib_thread", "openthread-otns"):
+            continue
         s = os.path.join(state_dir, item)
         d = os.path.join("/tmp", item)
         if os.path.isdir(s):
@@ -323,9 +386,9 @@ def restore_bdx_commissioned_state(topo_cfg: BdxTopologyConfig) -> bool:
         elif os.path.isfile(s):
             if item == "chip_counters.ini" and os.path.isfile(d):
                 continue
-            if item.startswith("chip_kvs_otns_"):
-                _strip_persisted_subscriptions_and_ota_state(s)
             shutil.copy2(s, d)
+            if item.startswith("chip_kvs_otns_"):
+                _strip_persisted_subscriptions_and_ota_state(d)
 
     for node in topo_cfg.matter_nodes:
         _strip_persisted_subscriptions_and_ota_state(f"/tmp/chip_kvs_otns_{node.node_id}")
@@ -421,7 +484,7 @@ exec -a ot-matter-node {ota_requestor_bin} \\
   --KVS "{kvs_path}" \\
   --maxBDXBlockSize {node.max_bdx_block_size} \\
   --otaDownloadPath "{node.ota_download_path}" \\
-  --watchdogTimeout 60 {mrp_flags} \\
+  --watchdogTimeout 7200 {mrp_flags} \\
   "${{norm_args[@]}}"
 """
         else:
@@ -498,6 +561,7 @@ def prepare_bdx_system(
             "net.ipv6.conf.all.disable_ipv6=0",
             "net.ipv6.conf.default.disable_ipv6=0",
             f"net.ipv6.conf.{backbone_if}.disable_ipv6=0",
+            f"net.ipv6.conf.{backbone_if}.accept_dad=0",
             "net.ipv6.conf.all.forwarding=1",
             "net.ipv6.auto_flowlabels=0",
         ],
@@ -512,7 +576,7 @@ def prepare_bdx_system(
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["ip", "-6", "addr", "replace", "fdde:ad00:beef:cafe::1/64", "dev", backbone_if],
+        ["ip", "-6", "addr", "replace", "fdde:ad00:beef:cafe::1/64", "dev", backbone_if, "nodad"],
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -607,7 +671,7 @@ def wait_for_bdx_mesh_and_srp(
                 continue
             if not ext_route_registered:
                 try:
-                    ns.node_cmd(otbr_id, "route add fd00:dead:beef:1::/64 s med")
+                    ns.node_cmd(otbr_id, "route add fdde:ad00:beef:cafe::/64 s med")
                     ns.node_cmd(otbr_id, "netdata register")
                     ext_route_registered = True
                 except Exception:
@@ -673,6 +737,7 @@ def verify_topology_routing(
     otbr_id: int,
     router_ids: List[int],
     topo_cfg: BdxTopologyConfig,
+    wifi_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Query live RLOC16s, parents, modes, and router tables on all OTNS nodes and verify expected hops."""
     otbr_rloc = ns.get_rloc16(otbr_id)
@@ -703,6 +768,21 @@ def verify_topology_routing(
                 "y": topo_cfg.routers[idx]["y"],
                 "radio_range": topo_cfg.routers[idx]["radio_range"],
                 "router_table": r_rt,
+            }
+        )
+
+    wifi_info: List[Dict[str, Any]] = []
+    for idx, w_id in enumerate(wifi_ids or []):
+        w_cfg = topo_cfg.wifi_interferers[idx] if idx < len(topo_cfg.wifi_interferers) else {}
+        wifi_info.append(
+            {
+                "otns_id": w_id,
+                "index": idx + 1,
+                "name": w_cfg.get("name", f"WiFi_{idx+1}"),
+                "x": int(w_cfg.get("x", 250)),
+                "y": int(w_cfg.get("y", 200)),
+                "radio_range": int(w_cfg.get("radio_range", 350)),
+                "tx_interferer_pct": int(w_cfg.get("tx_interferer_pct", 10)),
             }
         )
 
@@ -774,6 +854,7 @@ def verify_topology_routing(
             "router_table": otbr_rt,
         },
         "routers": routers_info,
+        "wifi_interferers": wifi_info,
         "matter_nodes": matter_info,
     }
     print("\n=== Programmatic Topology & RLOC16 Verification ===")
@@ -782,6 +863,11 @@ def verify_topology_routing(
         print(
             f"  Router {r_info['index']} ({r_info['name']}, otns_id={r_info['otns_id']}): "
             f"state={r_info['state']}, RLOC16={r_info['rloc16']}"
+        )
+    for w_info in wifi_info:
+        print(
+            f"  Wi-Fi Interferer {w_info['index']} ({w_info['name']}, otns_id={w_info['otns_id']}): "
+            f"pos=({w_info['x']},{w_info['y']}), txintf={w_info['tx_interferer_pct']}%"
         )
     for m_info in matter_info:
         print(
@@ -1044,7 +1130,10 @@ def archive_bdx_transfer_run(
     except Exception:
         ts_str = datetime.fromtimestamp(started_epoch).strftime("%Y%m%d_%H%M%S_%f")[:19]
 
-    req_node = next((n for n in topo_cfg.matter_nodes if n.app_type == "ota-requestor"), topo_cfg.matter_nodes[0])
+    req_nodes = [n for n in topo_cfg.matter_nodes if n.app_type == "ota-requestor"]
+    req_node = req_nodes[0] if req_nodes else topo_cfg.matter_nodes[0]
+    num_req = len(req_nodes) if req_nodes else 1
+    nreq_str = f"_n{num_req}" if num_req > 1 else ""
     plr_pct = int(round(topo_cfg.plr * 100))
     transport_str = "_tcp" if req_node.large_payload else ""
     sai_str = f"_sai{req_node.requestor_sai_ms}" if req_node.requestor_sai_ms else ""
@@ -1053,7 +1142,7 @@ def archive_bdx_transfer_run(
 
     run_id = (
         f"{ts_str}_{sanitize_slug(suite_name)}_{sanitize_slug(topo_cfg.topology_id)}_"
-        f"{topo_cfg.hops}hop_{req_node.thread_mode}_plr{plr_pct}_blk{block_size}{transport_str}{sai_str}{contend_str}{tag_str}"
+        f"{topo_cfg.hops}hop_{req_node.thread_mode}{nreq_str}_plr{plr_pct}_blk{block_size}{transport_str}{sai_str}{contend_str}{tag_str}"
     )
     run_dir = os.path.join(log_dir, run_id)
     nodes_dir = os.path.join(run_dir, "nodes")
@@ -1151,6 +1240,34 @@ def archive_bdx_transfer_run(
             }
         )
 
+    for w_info in verified_topo.get("wifi_interferers", []):
+        oid = w_info["otns_id"]
+        raw_name = f"0_{oid}.log"
+        friendly = f"otns_{oid:02d}_wifi_{w_info['index']:02d}.log"
+        src_p = os.path.join(OT_TMP_DIR, raw_name)
+        dst_p = os.path.join(nodes_dir, raw_name)
+        if os.path.isfile(src_p):
+            slice_node_log_preserving_header(src_p, node_log_start_lines.get(oid, 0), dst_p)
+            link_p = os.path.join(nodes_dir, friendly)
+            if not os.path.exists(link_p):
+                os.symlink(raw_name, link_p)
+        node_manifest.append(
+            {
+                "otns_id": oid,
+                "role": f"wifi_{w_info['index']}",
+                "name": w_info["name"],
+                "matter_node_id": None,
+                "rloc16": None,
+                "extaddr": "",
+                "x": w_info["x"],
+                "y": w_info["y"],
+                "radio_range": w_info["radio_range"],
+                "tx_interferer_pct": w_info["tx_interferer_pct"],
+                "raw_log": f"nodes/{raw_name}",
+                "named_log": f"nodes/{friendly}",
+            }
+        )
+
     # 3. Copy controller & OTA provider logs
     controller_files: List[str] = []
     if os.path.isfile(OTA_PROVIDER_LOG_PATH):
@@ -1197,6 +1314,7 @@ def archive_bdx_transfer_run(
         "topology_id": topo_cfg.topology_id,
         "transport": "tcp" if req_node.large_payload else "udp",
         "large_payload": bool(req_node.large_payload),
+        "num_requestors": num_req,
         "hops": topo_cfg.hops,
         "thread_mode": req_node.thread_mode,
         "poll_period_ms": req_node.poll_period_ms if req_node.thread_mode == "sed" else None,
@@ -1241,6 +1359,7 @@ def archive_bdx_transfer_run(
                         "suite": suite_name,
                         "topology_id": topo_cfg.topology_id,
                         "transport": "tcp" if req_node.large_payload else "udp",
+                        "num_requestors": num_req,
                         "hops": topo_cfg.hops,
                         "thread_mode": req_node.thread_mode,
                         "plr": topo_cfg.plr,
@@ -1293,10 +1412,11 @@ def execute_single_bdx_transfer(
     timeout_s: float = 180.0,
     run_tag: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Run one end-to-end BDX OTA transfer on the active OTNS mesh and archive its artifacts."""
-    req_node = next((n for n in topo_cfg.matter_nodes if n.app_type == "ota-requestor"), topo_cfg.matter_nodes[0])
-    assert req_node.otns_id is not None
-    req_log_path = os.path.join(OT_TMP_DIR, f"0_{req_node.otns_id}.log")
+    """Run one end-to-end BDX OTA transfer (single or multi-requestor) on the active OTNS mesh and archive its artifacts."""
+    req_nodes = [n for n in topo_cfg.matter_nodes if n.app_type == "ota-requestor"]
+    if not req_nodes:
+        req_nodes = [topo_cfg.matter_nodes[0]]
+    req_node = req_nodes[0]
 
     # Ensure OMR route is up on wpan0
     omr_prefix = ns.node_cmd(otbr_id, "br omrprefix")
@@ -1308,8 +1428,14 @@ def execute_single_bdx_transfer(
         src_pcap = os.path.join(OT_TMP_DIR, "current.pcap")
     pcap_start_offset = os.path.getsize(src_pcap) if os.path.isfile(src_pcap) else 24
 
+    all_otns_ids = (
+        [1]
+        + [r["otns_id"] for r in verified_topo["routers"]]
+        + [m["otns_id"] for m in verified_topo["matter_nodes"]]
+        + [w["otns_id"] for w in verified_topo.get("wifi_interferers", [])]
+    )
     node_log_start_lines: Dict[int, int] = {}
-    for oid in [1] + [r["otns_id"] for r in verified_topo["routers"]] + [m["otns_id"] for m in verified_topo["matter_nodes"]]:
+    for oid in all_otns_ids:
         lp = os.path.join(OT_TMP_DIR, f"0_{oid}.log")
         if os.path.isfile(lp):
             with open(lp, "r", encoding="utf-8", errors="replace") as f:
@@ -1317,11 +1443,12 @@ def execute_single_bdx_transfer(
         else:
             node_log_start_lines[oid] = 0
 
-    if os.path.isfile(req_node.ota_download_path):
-        try:
-            os.remove(req_node.ota_download_path)
-        except OSError:
-            pass
+    for rnode in req_nodes:
+        if os.path.isfile(rnode.ota_download_path):
+            try:
+                os.remove(rnode.ota_download_path)
+            except OSError:
+                pass
 
     # Start OTA Provider with the target --maxBDXBlockSize
     prov = OtaProviderProcess(
@@ -1342,6 +1469,15 @@ def execute_single_bdx_transfer(
     t_ack_eof: Optional[float] = None
     blocks_sent = 0
     mrp_retries_provider = 0
+
+    per_node_receive_init: Dict[int, Optional[float]] = {n.node_id: None for n in req_nodes}
+    per_node_ack_eof: Dict[int, Optional[float]] = {n.node_id: None for n in req_nodes}
+    per_node_blocks_sent: Dict[int, int] = {n.node_id: 0 for n in req_nodes}
+    per_node_mrp_retries: Dict[int, int] = {n.node_id: 0 for n in req_nodes}
+    per_node_completed: Dict[int, bool] = {n.node_id: False for n in req_nodes}
+    per_node_failure: Dict[int, Optional[str]] = {n.node_id: None for n in req_nodes}
+    per_node_reannounce_cnt: Dict[int, int] = {n.node_id: 0 for n in req_nodes}
+    per_node_last_announce: Dict[int, float] = {n.node_id: 0.0 for n in req_nodes}
 
     try:
         prov.wait_for_ready(timeout_s=15.0)
@@ -1387,28 +1523,47 @@ def execute_single_bdx_transfer(
             contend_thread = threading.Thread(target=_contend_worker, daemon=True)
             contend_thread.start()
 
+        wifi_pct = max((w.get("tx_interferer_pct", 0) for w in verified_topo.get("wifi_interferers", [])), default=0)
         print(
             f"\n>>> [BDX Transfer] suite={suite_name} hops={topo_cfg.hops} mode={req_node.thread_mode} "
-            f"plr={topo_cfg.plr*100:.0f}% block_size={block_size}B image={image_size_bytes}B "
+            f"requestors={[n.node_id for n in req_nodes]} plr={topo_cfg.plr*100:.0f}% wifi={wifi_pct}% "
+            f"block_size={block_size}B image={image_size_bytes}B/node "
+            f"transport={'tcp' if req_node.large_payload else 'udp'} "
             f"sai={req_node.requestor_sai_ms or 300}ms contend={contend_traffic}"
         )
 
-        # Trigger AnnounceOTAProvider
-        run_chip_tool(
-            chip_tool_bin,
-            [
-                "otasoftwareupdaterequestor",
-                "announce-otaprovider",
-                str(topo_cfg.provider_node_id),
-                "0",
-                "0",
-                "0",
-                str(req_node.node_id),
-                "0",
-            ],
-            timeout_s=45,
-            retries=3,
-        )
+        # Trigger AnnounceOTAProvider on all requestor nodes, waiting briefly for each node's
+        # ~350ms CASE handshake on CASEServer to complete so concurrent Sigma1s do not hit Busy.
+        for rnode in req_nodes:
+            run_chip_tool(
+                chip_tool_bin,
+                [
+                    "otasoftwareupdaterequestor",
+                    "announce-otaprovider",
+                    str(topo_cfg.provider_node_id),
+                    "0",
+                    "0",
+                    "0",
+                    str(rnode.node_id),
+                    "0",
+                ],
+                timeout_s=45,
+                retries=3,
+            )
+            per_node_last_announce[rnode.node_id] = time.time()
+            case_wait_deadline = time.time() + 1.8
+            target_hex_upper = f"{rnode.node_id:016X}"
+            target_hex_lower = f"{rnode.node_id:016x}"
+            while time.time() < case_wait_deadline:
+                with prov.cv:
+                    seen_case = any(
+                        (target_hex_upper in ln or target_hex_lower in ln)
+                        and ("CASE Session established" in ln or "ReceiveInit" in ln or "Msg RX from 1:" in ln)
+                        for ln in prov.lines
+                    )
+                if seen_case:
+                    break
+                time.sleep(0.1)
 
         t_announce = time.time()
         deadline = t_announce + timeout_s
@@ -1421,36 +1576,134 @@ def execute_single_bdx_transfer(
                 prov_cursor = len(prov.lines)
 
             for line in new_prov_lines:
-                if "BDX:ReceiveInit" in line and t_receive_init is None:
-                    m_ts = re.search(r"\[(\d+\.\d+)\]", line)
-                    t_receive_init = float(m_ts.group(1)) if m_ts else time.time()
-                elif ("Type 0002:11 (BDX:Block)" in line or "Type 0002:12 (BDX:BlockEOF)" in line) and "<<<" in line:
+                m_ts = re.search(r"\[(\d+\.\d+)\]", line)
+                line_ts = float(m_ts.group(1)) if m_ts else time.time()
+
+                # Identify peer node_id if present in the log line
+                matched_nid: Optional[int] = None
+                for rnode in req_nodes:
+                    if (
+                        f"1:{rnode.node_id:016X}" in line
+                        or f"1:{rnode.node_id:016x}" in line
+                        or f"node 0x{rnode.node_id:016X}" in line
+                        or f"node 0x{rnode.node_id:016x}" in line
+                    ):
+                        matched_nid = rnode.node_id
+                        break
+                if matched_nid is None and len(req_nodes) == 1:
+                    matched_nid = req_nodes[0].node_id
+
+                if "BDX:ReceiveInit" in line or "ReceiveInit accepted for node" in line:
+                    if t_receive_init is None:
+                        t_receive_init = line_ts
+                    if matched_nid is not None and per_node_receive_init[matched_nid] is None:
+                        per_node_receive_init[matched_nid] = line_ts
+                elif ("Type 0002:11 (BDX:Block)" in line or "Type 0002:12 (BDX:BlockEOF)" in line) and (
+                    "<<<" in line or "<<5" in line
+                ):
                     blocks_sent += 1
+                    if matched_nid is not None:
+                        per_node_blocks_sent[matched_nid] += 1
                 elif re.search(r"<<\d+\s+\[E:.*Msg Retransmission to", line) or "Retransmitting MessageCounter:" in line:
                     mrp_retries_provider += 1
-                elif ("Type 0002:14 (BDX:BlockAckEOF)" in line or "Transfer completed, got AckEOF" in line) and not completed:
-                    m_ts = re.search(r"\[(\d+\.\d+)\]", line)
-                    t_ack_eof = float(m_ts.group(1)) if m_ts else time.time()
-                    completed = True
-                elif "TransferSession error" in line or ("Msg Retransmission" in line and "failure" in line):
-                    failure_reason = line.strip()
+                    if matched_nid is not None:
+                        per_node_mrp_retries[matched_nid] += 1
+                elif "Type 0002:14 (BDX:BlockAckEOF)" in line or "Transfer completed, got AckEOF" in line:
+                    t_ack_eof = line_ts
+                    if matched_nid is not None:
+                        per_node_ack_eof[matched_nid] = line_ts
+                        per_node_completed[matched_nid] = True
+                    elif len(req_nodes) == 1:
+                        per_node_ack_eof[req_nodes[0].node_id] = line_ts
+                        per_node_completed[req_nodes[0].node_id] = True
+                elif (
+                    "OnResponseTimeout for node" in line
+                    or "TransferSession error" in line
+                    or "Transfer timed out" in line
+                    or ("Msg Retransmission" in line and "failure" in line)
+                ):
+                    if matched_nid is not None and not per_node_completed[matched_nid]:
+                        per_node_failure[matched_nid] = line.strip()
+                    elif len(req_nodes) == 1:
+                        per_node_failure[req_nodes[0].node_id] = line.strip()
+                    if failure_reason is None:
+                        failure_reason = line.strip()
 
-            if completed:
-                # Wait briefly for Requestor to flush "OTA image downloaded to ..." and Reset()
+            # Also check downloaded file sizes on disk in case final BlockAckEOF was lost on air after Requestor finished writing
+            for rnode in req_nodes:
+                if not per_node_completed[rnode.node_id] and os.path.isfile(rnode.ota_download_path):
+                    try:
+                        if os.path.getsize(rnode.ota_download_path) >= image_size_bytes:
+                            per_node_completed[rnode.node_id] = True
+                            if per_node_ack_eof[rnode.node_id] is None:
+                                per_node_ack_eof[rnode.node_id] = time.time()
+                    except OSError:
+                        pass
+
+            if all(per_node_completed[n.node_id] for n in req_nodes):
+                completed = True
                 time.sleep(1.0)
                 break
 
-            if failure_reason is not None:
+            if all(
+                (per_node_completed[n.node_id] or per_node_failure[n.node_id] is not None)
+                for n in req_nodes
+            ):
                 time.sleep(1.0)
                 break
 
+            # If a requestor node has not initiated BDX:ReceiveInit within 5.5s of announcement
+            # (e.g., due to single-instance CASEServer returning Busy when N nodes initiate CASE concurrently),
+            # re-announce one node at a time (staggered by >=2.0s) so all N sessions overlap without colliding.
             now = time.time()
+            for rnode in req_nodes:
+                nid = rnode.node_id
+                if (
+                    per_node_receive_init[nid] is None
+                    and per_node_failure[nid] is None
+                    and not per_node_completed[nid]
+                    and per_node_reannounce_cnt[nid] < 5
+                    and (now - per_node_last_announce[nid]) >= 5.5
+                ):
+                    per_node_reannounce_cnt[nid] += 1
+                    per_node_last_announce[nid] = now
+                    print(f"  [bdx-reannounce] Node {nid} has not sent ReceiveInit yet; re-sending AnnounceOTAProvider (attempt {per_node_reannounce_cnt[nid]})...")
+                    try:
+                        run_chip_tool(
+                            chip_tool_bin,
+                            [
+                                "otasoftwareupdaterequestor",
+                                "announce-otaprovider",
+                                str(topo_cfg.provider_node_id),
+                                "0",
+                                "0",
+                                "0",
+                                str(nid),
+                                "0",
+                            ],
+                            timeout_s=30,
+                            retries=2,
+                        )
+                    except Exception as exc:
+                        print(f"  [bdx-reannounce] Warning: re-announce to {nid} returned: {exc}")
+                    break
+
             if now - last_progress_log >= 5.0:
                 last_progress_log = now
-                print(
-                    f"  [bdx-progress] elapsed={now - t_announce:.1f}s blocks_tx={blocks_sent} "
-                    f"prov_mrp_retries={mrp_retries_provider}"
-                )
+                if len(req_nodes) > 1:
+                    per_node_str = " ".join(
+                        f"n{n.node_id}:blk={per_node_blocks_sent[n.node_id]},retx={per_node_mrp_retries[n.node_id]},done={per_node_completed[n.node_id]}"
+                        for n in req_nodes
+                    )
+                    print(
+                        f"  [bdx-progress] elapsed={now - t_announce:.1f}s total_blocks_tx={blocks_sent} "
+                        f"prov_mrp_retries={mrp_retries_provider} [{per_node_str}]"
+                    )
+                else:
+                    print(
+                        f"  [bdx-progress] elapsed={now - t_announce:.1f}s blocks_tx={blocks_sent} "
+                        f"prov_mrp_retries={mrp_retries_provider}"
+                    )
             time.sleep(0.25)
 
         if not completed and failure_reason is None:
@@ -1465,23 +1718,50 @@ def execute_single_bdx_transfer(
         prov.stop()
 
     completed_epoch = time.time()
-    if t_receive_init is not None and t_ack_eof is not None and t_ack_eof >= t_receive_init:
+    valid_inits = [ts for ts in per_node_receive_init.values() if ts is not None]
+    valid_eofs = [ts for ts in per_node_ack_eof.values() if ts is not None]
+    if valid_inits and valid_eofs and max(valid_eofs) >= min(valid_inits):
+        transfer_duration_s = round(max(valid_eofs) - min(valid_inits), 4)
+    elif t_receive_init is not None and t_ack_eof is not None and t_ack_eof >= t_receive_init:
         transfer_duration_s = round(t_ack_eof - t_receive_init, 4)
     else:
         transfer_duration_s = round(completed_epoch - started_epoch, 4)
 
-    dl_size = os.path.getsize(req_node.ota_download_path) if os.path.isfile(req_node.ota_download_path) else 0
+    total_dl_size = 0
+    per_requestor_metrics: Dict[str, Any] = {}
+    for rnode in req_nodes:
+        nid = rnode.node_id
+        dl_sz = os.path.getsize(rnode.ota_download_path) if os.path.isfile(rnode.ota_download_path) else 0
+        total_dl_size += dl_sz
+        n_init = per_node_receive_init[nid]
+        n_eof = per_node_ack_eof[nid]
+        n_dur = round(n_eof - n_init, 4) if (n_init is not None and n_eof is not None and n_eof >= n_init) else transfer_duration_s
+        per_requestor_metrics[str(nid)] = {
+            "node_id": nid,
+            "name": rnode.name,
+            "completed": per_node_completed[nid],
+            "failure_reason": per_node_failure[nid],
+            "transfer_duration_s": n_dur,
+            "blocks_sent_provider": per_node_blocks_sent[nid],
+            "mrp_retries_provider": per_node_mrp_retries[nid],
+            "downloaded_bytes": dl_sz,
+        }
+
     metrics = {
         "completed": completed,
+        "num_requestors": len(req_nodes),
+        "completed_requestors": sum(1 for n in req_nodes if per_node_completed[n.node_id]),
         "failure_reason": failure_reason,
         "transfer_duration_s": transfer_duration_s,
         "blocks_sent_provider": blocks_sent,
         "mrp_retries_provider": mrp_retries_provider,
-        "downloaded_bytes": dl_size,
+        "downloaded_bytes": total_dl_size,
+        "per_requestor_metrics": per_requestor_metrics,
     }
     print(
-        f"  [bdx-result] completed={completed} duration={transfer_duration_s:.3f}s "
-        f"blocks_sent={blocks_sent} mrp_retries={mrp_retries_provider} dl_bytes={dl_size}"
+        f"  [bdx-result] completed={completed} ({metrics['completed_requestors']}/{len(req_nodes)} nodes) "
+        f"duration={transfer_duration_s:.3f}s blocks_sent={blocks_sent} "
+        f"mrp_retries={mrp_retries_provider} total_dl_bytes={total_dl_size}"
     )
 
     run_dir = archive_bdx_transfer_run(
@@ -1524,6 +1804,7 @@ def run_otns_session_transfers(
     contend_traffic: bool = False,
     timeout_s: float = 180.0,
     run_tag: Optional[str] = None,
+    num_requestors: Optional[int] = None,
 ) -> List[Tuple[str, Dict[str, Any]]]:
     """Start an OTNS session for (config, hops, mode, plr) and execute BDX transfers for each block_size."""
     default_max = 8192 if large_payload else 1024
@@ -1538,6 +1819,7 @@ def run_otns_session_transfers(
         large_payload=large_payload,
         requestor_sai_ms=requestor_sai_ms,
         requestor_sii_ms=requestor_sii_ms,
+        num_requestors=num_requestors,
     )
     backbone_if = detect_backbone_interface()
     os.chdir(OT_VERSIONS_DIR)
@@ -1607,14 +1889,14 @@ def run_otns_session_transfers(
                 ns.node_cmd(node.otns_id, f"pollperiod {node.poll_period_ms}")
             time.sleep(1.0)
 
-        if not wait_for_bdx_mesh_and_srp(ns, otbr_id=otbr_id, matter_nodes=topo_cfg.matter_nodes, timeout_s=80):
+        if not wait_for_bdx_mesh_and_srp(ns, otbr_id=otbr_id, matter_nodes=topo_cfg.matter_nodes, timeout_s=120):
             raise RuntimeError("Timed out waiting for Matter nodes to attach and register SRP")
 
         time.sleep(3.0)
         omr_prefix = ns.node_cmd(otbr_id, "br omrprefix")
         configure_border_router_routes(omr_prefix)
 
-        # Commission during 0% PLR so commissioning itself is fast and reliable
+        # Commission during 0% PLR and before starting Wi-Fi interference so commissioning is fast and reliable
         _, initial_ota_path = create_ota_image(image_size_bytes, software_version=2)
         commission_topology_and_provider(
             chip_tool_bin=chip_tool_bin,
@@ -1624,13 +1906,31 @@ def run_otns_session_transfers(
             state_reused=state_reused,
         )
 
+        # Add Wi-Fi interferers after commissioning (consuming configured % of airtime during BDX transfers)
+        wifi_ids: List[int] = []
+        for w_cfg in topo_cfg.wifi_interferers:
+            w_x = int(w_cfg.get("x", 250))
+            w_y = int(w_cfg.get("y", 200))
+            w_rr = int(w_cfg.get("radio_range", 350))
+            tx_pct = int(w_cfg.get("tx_interferer_pct", 10))
+            w_id = ns.add("wifi", x=w_x, y=w_y, radio_range=w_rr)
+            ns._do_command(f"rfsim {w_id} txintf {tx_pct}")
+            wifi_ids.append(w_id)
+            print(
+                f"  [otns] Added Wi-Fi interferer (otns_id={w_id}, name={w_cfg.get('name', 'WiFi')}) "
+                f"at ({w_x}, {w_y}), radio_range={w_rr}, txintf={tx_pct}% airtime"
+            )
+            time.sleep(0.5)
+
         # Apply target packet loss ratio (plr) for the benchmark transfer(s)
         if plr > 0.0:
             print(f"  [otns] Setting global packet loss ratio plr={plr:.3f} ({plr*100:.1f}% FER)")
             ns.packet_loss_ratio = plr
             time.sleep(0.5)
 
-        verified_topo = verify_topology_routing(ns, otbr_id=otbr_id, router_ids=router_ids, topo_cfg=topo_cfg)
+        verified_topo = verify_topology_routing(
+            ns, otbr_id=otbr_id, router_ids=router_ids, topo_cfg=topo_cfg, wifi_ids=wifi_ids
+        )
 
         for idx, bsize in enumerate(block_sizes):
             # Increment software version per transfer so Requestor always sees a newer version (> current)
@@ -1669,9 +1969,25 @@ def main() -> int:
     )
     parser.add_argument(
         "--suite",
-        choices=["single", "suite1", "suite2", "suite3", "suite4", "suite_tcp", "all"],
+        choices=[
+            "single",
+            "suite1",
+            "suite2",
+            "suite3",
+            "suite4",
+            "suite_tcp",
+            "suite_dual_med_wifi",
+            "suite_congestion_scale",
+            "all",
+        ],
         default="single",
         help="Benchmark suite to execute",
+    )
+    parser.add_argument(
+        "--num-requestors",
+        type=int,
+        default=None,
+        help="Number of concurrent MED OTA Requestor nodes (e.g., 2..6) sharing Router 1",
     )
     parser.add_argument("--hops", type=int, default=3, choices=[1, 2, 3], help="Hop distance for multihop topology")
     parser.add_argument("--mode", choices=["med", "sed"], default="med", help="Thread mode for OTARequestor")
@@ -1715,6 +2031,61 @@ def main() -> int:
 
     multihop_cfg = os.path.join(REPO_ROOT, "scripts/otns/otns_bdx_multihop.json")
     scen2_cfg = os.path.join(REPO_ROOT, "scripts/otns/otns_bdx_scenario2_router_drops.json")
+    dual_med_wifi_cfg = os.path.join(REPO_ROOT, "scripts/otns/otns_bdx_dual_med_wifi.json")
+
+    if args.suite == "suite_congestion_scale":
+        n_list = [args.num_requestors] if args.num_requestors is not None else [2, 3, 4, 5, 6]
+        bsize = 4096 if (args.large_payload and args.block_size == 340) else args.block_size
+        for n_req in n_list:
+            run_otns_session_transfers(
+                config_path=dual_med_wifi_cfg,
+                suite_name="suite_congestion_scale",
+                hops=2,
+                mode="med",
+                poll_period_ms=args.poll_period_ms,
+                plr=0.05,
+                block_sizes=[bsize],
+                image_size_bytes=args.image_size_bytes,
+                ota_requestor_bin=args.ota_requestor_bin,
+                ota_provider_bin=args.ota_provider_bin,
+                all_devices_bin=args.all_devices_bin,
+                chip_tool_bin=args.chip_tool_bin,
+                log_dir=args.log_dir,
+                reuse_state=args.reuse_state,
+                large_payload=args.large_payload,
+                timeout_s=max(args.timeout_sec, 300.0),
+                run_tag=args.run_tag,
+                num_requestors=n_req,
+            )
+        return 0
+
+    if args.suite == "suite_dual_med_wifi":
+        sweep_blocks = (
+            [int(x.strip()) for x in args.block_sizes.split(",") if x.strip()]
+            if args.block_sizes
+            else (SUITE_TCP_BLOCK_SIZES if args.large_payload else SUITE2_BLOCK_SIZES)
+        )
+        run_otns_session_transfers(
+            config_path=dual_med_wifi_cfg,
+            suite_name="suite_dual_med_wifi",
+            hops=2,
+            mode="med",
+            poll_period_ms=args.poll_period_ms,
+            plr=0.05,
+            block_sizes=sweep_blocks,
+            image_size_bytes=args.image_size_bytes,
+            ota_requestor_bin=args.ota_requestor_bin,
+            ota_provider_bin=args.ota_provider_bin,
+            all_devices_bin=args.all_devices_bin,
+            chip_tool_bin=args.chip_tool_bin,
+            log_dir=args.log_dir,
+            reuse_state=args.reuse_state,
+            large_payload=args.large_payload,
+            timeout_s=args.timeout_sec,
+            run_tag=args.run_tag,
+            num_requestors=args.num_requestors,
+        )
+        return 0
 
     if args.suite == "single":
         bsizes = (
@@ -1743,6 +2114,7 @@ def main() -> int:
             contend_traffic=args.contend_traffic,
             timeout_s=args.timeout_sec,
             run_tag=args.run_tag,
+            num_requestors=args.num_requestors,
         )
         return 0
 

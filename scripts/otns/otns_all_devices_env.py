@@ -602,6 +602,12 @@ def configure_border_router_routes(omr_prefix_lines: List[str]) -> None:
             stderr=subprocess.DEVNULL,
         )
 
+    subprocess.run(
+        ["ip", "-6", "addr", "replace", "fdde:ad00:beef:cafe::1/64", "dev", "eth0", "nodad"],
+        check=False,
+        stderr=subprocess.DEVNULL,
+    )
+
     # Route Matter Site-Local multicast addresses (ff05::fa for IanaAddr and ff35::/16 for PerGroup)
     # out wpan0 so otbr-agent encapsulates them into MPL (ff03::fc) across the Thread mesh.
     for mcast_prefix in ["ff05::/16", "ff35::/16"]:

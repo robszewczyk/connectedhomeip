@@ -1,0 +1,71 @@
+{
+  "description": "Dual-MED 2-Hop Shared-Router BDX OTA Topology with 5% FER and 10% Wi-Fi Interferer: OTBR Leader <-> A1 (Shared Router) <-> {OTARequestor 1 (MED), OTARequestor 2 (MED)} + Wi-Fi Interferer (10% airtime)",
+  "topology_id": "bdx_dual_med_wifi",
+  "topology_name": "bdx_dual_med_wifi",
+  "radio_model": "MIDisc",
+  "default_hops": 2,
+  "default_plr": 0.05,
+  "otbr": {
+    "name": "Home Hub (OTBR Leader)",
+    "x": 100,
+    "y": 250,
+    "radio_range": 180
+  },
+  "routers": [
+    {
+      "name": "A1 (Shared Intermediate Router, Hop 1)",
+      "x": 250,
+      "y": 250,
+      "radio_range": 180
+    }
+  ],
+  "wifi_interferers": [
+    {
+      "name": "WiFi Interferer (10% Airtime)",
+      "x": 250,
+      "y": 200,
+      "radio_range": 350,
+      "tx_interferer_pct": 10
+    }
+  ],
+  "ota_provider": {
+    "node_id": 999,
+    "discriminator": 2222,
+    "passcode": 20202021,
+    "port": 5540
+  },
+  "matter_nodes": [
+    {
+      "name": "OTARequestor_1",
+      "role": "ota_requestor",
+      "app": "ota-requestor-app",
+      "node_id": 101,
+      "discriminator": 3840,
+      "passcode": 20202021,
+      "x": 400,
+      "y": 220,
+      "radio_range": 180,
+      "router_eligible": false,
+      "thread_mode": "med",
+      "poll_period_ms": 200,
+      "ota_download_path": "/tmp/ota_dl_101.bin",
+      "devices": []
+    },
+    {
+      "name": "OTARequestor_2",
+      "role": "ota_requestor",
+      "app": "ota-requestor-app",
+      "node_id": 102,
+      "discriminator": 3842,
+      "passcode": 20202021,
+      "x": 400,
+      "y": 280,
+      "radio_range": 180,
+      "router_eligible": false,
+      "thread_mode": "med",
+      "poll_period_ms": 200,
+      "ota_download_path": "/tmp/ota_dl_102.bin",
+      "devices": []
+    }
+  ]
+}
