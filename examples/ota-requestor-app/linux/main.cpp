@@ -59,6 +59,8 @@ public:
     bool CanConsent() override;
     void UpdateDownloaded() override;
     void UpdateConfirmed(System::Clock::Seconds32 delay) override;
+    void ProcessAnnounceOTAProviders(const ProviderLocationType & providerLocation,
+                                     app::Clusters::OtaSoftwareUpdateRequestor::OTAAnnouncementReason announcementReason) override;
     static void AppliedNotifyUpdateTimer(System::Layer * systemLayer, void * appState);
     void SendNotifyUpdateApplied();
 };
@@ -203,6 +205,23 @@ void CustomOTARequestorDriver::SendNotifyUpdateApplied()
 
     // Reset to put the state back to idle to allow the next OTA update to occur
     gRequestorCore.Reset();
+}
+
+void CustomOTARequestorDriver::ProcessAnnounceOTAProviders(
+    const ProviderLocationType & providerLocation,
+    app::Clusters::OtaSoftwareUpdateRequestor::OTAAnnouncementReason announcementReason)
+{
+    if (gRequestorCore.GetCurrentUpdateState() != OTAUpdateStateEnum::kIdle)
+    {
+        gRequestorCore.CancelImageUpdate();
+    }
+    ScopedNodeId peerId(providerLocation.providerNodeID, providerLocation.fabricIndex);
+    Server::GetInstance().GetSecureSessionManager().ExpireAllSessions(peerId);
+    if (Server::GetInstance().GetCASESessionManager() != nullptr)
+    {
+        Server::GetInstance().GetCASESessionManager()->ReleaseSession(peerId);
+    }
+    ExtendedOTARequestorDriver::ProcessAnnounceOTAProviders(providerLocation, announcementReason);
 }
 
 static void InitOTARequestor(void)
