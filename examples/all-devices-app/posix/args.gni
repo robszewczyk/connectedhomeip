@@ -30,6 +30,36 @@ chip_config_enable_groupcast = true
 
 chip_device_config_enable_wifi_pdc = true
 
+openthread_config_thread_version = 4
+openthread_enable_ping_sender = true
+openthread_enable_sntp_client = true
+openthread_enable_dns_client = true
+openthread_enable_dnssd_server = true
+openthread_enable_srp_server = true
+openthread_enable_dhcp6_client = true
+openthread_enable_dhcp6_server = true
+openthread_enable_JOINER = true
+openthread_enable_commissioner = true
+openthread_enable_border_routing = true
+openthread_enable_border_router = true
+openthread_enable_border_agent = true
+openthread_enable_backbone_router = true
+openthread_enable_channel_manager = true
+openthread_enable_channel_monitor = true
+openthread_enable_coap = true
+openthread_enable_coaps = true
+openthread_enable_ecdsa = true
+openthread_enable_jam_detection = true
+openthread_enable_mac_filter = true
+openthread_enable_service = true
+openthread_enable_operational_dataset_updater = true
+openthread_enable_ip6_fragm = true
+openthread_enable_tmf_netdata_service = true
+openthread_enable_mlr = true
+openthread_enable_dua = true
+openthread_enable_slaac = true
+openthread_enable_sntp_client = true
+
 matter_enable_tracing_support = true
 matter_log_json_payload_decode_full = true
 matter_log_json_payload_hex = true
