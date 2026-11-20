@@ -126,6 +126,8 @@ enum
     kDeviceOption_WiFiSupports5g,
 #if CONFIG_BUILD_FOR_HOST_UNIT_TEST
     kDeviceOption_SubscriptionResumptionRetryIntervalSec,
+#endif
+#if CONFIG_BUILD_FOR_HOST_UNIT_TEST || CHIP_DEVICE_CONFIG_ENABLE_DYNAMIC_MRP_CONFIG
     kDeviceOption_IdleRetransmitTimeout,
     kDeviceOption_ActiveRetransmitTimeout,
     kDeviceOption_ActiveThresholdTime,
@@ -250,6 +252,8 @@ OptionDef sDeviceOptionDefs[] = {
 #if CONFIG_BUILD_FOR_HOST_UNIT_TEST
     { "subscription-capacity", kArgumentRequired, kDeviceOption_SubscriptionCapacity },
     { "subscription-resumption-retry-interval", kArgumentRequired, kDeviceOption_SubscriptionResumptionRetryIntervalSec },
+#endif
+#if CONFIG_BUILD_FOR_HOST_UNIT_TEST || CHIP_DEVICE_CONFIG_ENABLE_DYNAMIC_MRP_CONFIG
     { "idle-retransmit-timeout", kArgumentRequired, kDeviceOption_IdleRetransmitTimeout },
     { "active-retransmit-timeout", kArgumentRequired, kDeviceOption_ActiveRetransmitTimeout },
     { "active-threshold-time", kArgumentRequired, kDeviceOption_ActiveThresholdTime },
@@ -880,12 +884,19 @@ bool HandleOption(const char * aProgram, OptionSet * aOptions, int aIdentifier, 
         LinuxDeviceOptions::GetInstance().subscriptionResumptionRetryIntervalSec =
             static_cast<int32_t>(strtoul(aValue, nullptr, 0));
         break;
+#endif
+#if CONFIG_BUILD_FOR_HOST_UNIT_TEST || CHIP_DEVICE_CONFIG_ENABLE_DYNAMIC_MRP_CONFIG
     case kDeviceOption_IdleRetransmitTimeout: {
         auto mrpConfig            = GetLocalMRPConfig().ValueOr(GetDefaultMRPConfig());
         auto idleRetransTimeout   = System::Clock::Milliseconds32(static_cast<uint32_t>(strtoul(aValue, nullptr, 0)));
         auto activeRetransTimeout = mrpConfig.mActiveRetransTimeout;
         auto activeThresholdTime  = mrpConfig.mActiveThresholdTime;
+#if CONFIG_BUILD_FOR_HOST_UNIT_TEST
         OverrideLocalMRPConfig(idleRetransTimeout, activeRetransTimeout, activeThresholdTime);
+#else
+        ReliableMessageProtocolConfig::SetLocalMRPConfig(
+            MakeOptional<ReliableMessageProtocolConfig>(idleRetransTimeout, activeRetransTimeout, activeThresholdTime));
+#endif
         break;
     }
 
@@ -894,7 +905,12 @@ bool HandleOption(const char * aProgram, OptionSet * aOptions, int aIdentifier, 
         auto idleRetransTimeout   = mrpConfig.mIdleRetransTimeout;
         auto activeRetransTimeout = System::Clock::Milliseconds32(static_cast<uint32_t>(strtoul(aValue, nullptr, 0)));
         auto activeThresholdTime  = mrpConfig.mActiveThresholdTime;
+#if CONFIG_BUILD_FOR_HOST_UNIT_TEST
         OverrideLocalMRPConfig(idleRetransTimeout, activeRetransTimeout, activeThresholdTime);
+#else
+        ReliableMessageProtocolConfig::SetLocalMRPConfig(
+            MakeOptional<ReliableMessageProtocolConfig>(idleRetransTimeout, activeRetransTimeout, activeThresholdTime));
+#endif
         break;
     }
 
@@ -903,7 +919,12 @@ bool HandleOption(const char * aProgram, OptionSet * aOptions, int aIdentifier, 
         auto idleRetransTimeout   = mrpConfig.mIdleRetransTimeout;
         auto activeRetransTimeout = mrpConfig.mActiveRetransTimeout;
         auto activeThresholdTime  = System::Clock::Milliseconds16(static_cast<uint16_t>(strtoul(aValue, nullptr, 0)));
+#if CONFIG_BUILD_FOR_HOST_UNIT_TEST
         OverrideLocalMRPConfig(idleRetransTimeout, activeRetransTimeout, activeThresholdTime);
+#else
+        ReliableMessageProtocolConfig::SetLocalMRPConfig(
+            MakeOptional<ReliableMessageProtocolConfig>(idleRetransTimeout, activeRetransTimeout, activeThresholdTime));
+#endif
         break;
     }
 #endif
